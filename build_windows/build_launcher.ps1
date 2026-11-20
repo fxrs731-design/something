@@ -10,7 +10,9 @@ $ReleaseDir = Join-Path (Get-Location) "dist\F1ClassicLauncher_Windows"
 $WorkDir = Join-Path (Get-Location) "build\pyinstaller"
 if (Test-Path $ReleaseDir) { Remove-Item $ReleaseDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
-pyinstaller --noconfirm --clean --onefile --name F1ClassicLauncher --distpath (Join-Path (Get-Location) "dist") --workpath $WorkDir --specpath (Join-Path (Get-Location) "build") --paths . --hidden-import core.backup_manager --hidden-import core.config_manager --hidden-import core.game_adapters --hidden-import core.game_detector --hidden-import core.logger --hidden-import core.manifest_parser --hidden-import core.mod_installer --hidden-import core.package_importer --hidden-import core.path_utils --hidden-import core.season_manager --hidden-import ui.app_server --add-data "frontend.html;." main.py
+$FrontendFile = Join-Path (Get-Location) "frontend.html"
+if (!(Test-Path $FrontendFile)) { throw "frontend.html is missing from the repository root." }
+pyinstaller --noconfirm --clean --onefile --name F1ClassicLauncher --distpath (Join-Path (Get-Location) "dist") --workpath $WorkDir --specpath (Join-Path (Get-Location) "build") --paths . --hidden-import core.backup_manager --hidden-import core.config_manager --hidden-import core.game_adapters --hidden-import core.game_detector --hidden-import core.logger --hidden-import core.manifest_parser --hidden-import core.mod_installer --hidden-import core.package_importer --hidden-import core.path_utils --hidden-import core.season_manager --hidden-import ui.app_server --add-data "$FrontendFile;." main.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 $Exe = Join-Path (Get-Location) "dist\F1ClassicLauncher.exe"
 if (!(Test-Path $Exe)) { throw "PyInstaller did not produce F1ClassicLauncher.exe." }
