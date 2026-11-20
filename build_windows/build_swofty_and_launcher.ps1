@@ -46,41 +46,10 @@ New-Item -ItemType Directory -Force -Path $ShimBin | Out-Null
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 New-Item -ItemType Directory -Force -Path $SwoftyCoreOut | Out-Null
 
-# Create Windows Git Bash shims for Linux-only utilities (taskset, nice)
-@'
-#!/usr/bin/env bash
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -c|-p|-a|--cpu-list|--pid|--all-tasks)
-      shift 2
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
-exec "$@"
-'@ | Set-Content -Path (Join-Path $ShimBin "taskset") -Encoding Ascii -NoNewline
-
-@'
-#!/usr/bin/env bash
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -n|--adjustment)
-      shift 2
-      ;;
-    -[0-9]*)
-      shift
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
-exec "$@"
-'@ | Set-Content -Path (Join-Path $ShimBin "nice") -Encoding Ascii -NoNewline
-
-$env:PATH = "$ShimBin;$env:PATH"
+# Do not shim taskset/nice on Windows. Swofty's native/tools/pin.sh
+# detects taskset by running `taskset -pc $$`; a simplistic shim breaks that
+# probe (Git Bash does not provide taskset by default). In GitHub Actions CI,
+# pin.sh intentionally leaves PIN empty and lets Ninja choose its job count.
 
 # 2. Clone or update Swofty-Developments/SwoftyLauncher
 if (-not (Test-Path $SwoftyRepo)) {
