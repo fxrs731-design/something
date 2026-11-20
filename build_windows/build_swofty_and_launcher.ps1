@@ -92,27 +92,23 @@ if (Test-Path "THIRD_PARTY.md") {
 if (-not (Test-Path "native\build.sh")) {
     throw "Expected native/build.sh not found in SwoftyLauncher repository."
 }
-# The upstream Swofty build_graph.py currently treats three optional/legacy translation
-# units as mandatory even though they are absent from the current checkout:
-# registry/engine.cpp (test-only), hooks/guard.cpp, and diagnostics/crash/stall_walk.cpp.
-# Keep its source discovery behavior, but remove that stale existence assertion so the
-# native build can proceed with the source files actually present in this revision.
+# Normalize source paths in Swofty's build graph. Python's os.path.relpath()
+# returns backslashes on Windows, but core_link_order.txt uses forward slashes.
+# Without normalization, every native source appears missing from the link order.
 $BuildGraphPatch = @'
 from pathlib import Path
 p = Path("native/tools/build_graph.py")
 s = p.read_text(encoding="utf-8")
-old = """    missing = (CORE_EXCLUDE | set(SEH_SOURCES)) - set(core_sources)
-    if missing:
-        sys.exit(f'build_graph.py: listed sources that no longer exist: {sorted(missing)}')
-"""
+old = "found.append(os.path.relpath(os.path.join(dirpath, name), NATIVE))"
+new = "found.append(os.path.relpath(os.path.join(dirpath, name), NATIVE).replace(os.sep, '/'))"
 if old not in s:
-    raise SystemExit("Expected stale build_graph.py source assertion was not found; refusing to patch.")
-p.write_text(s.replace(old, "    # Optional/legacy source entries may be absent in newer Swofty revisions.\\n"), encoding="utf-8")
-print("Patched build_graph.py: absent optional legacy sources are no longer fatal.")
+    raise SystemExit("Expected source-discovery line was not found; refusing to patch.")
+p.write_text(s.replace(old, new), encoding="utf-8")
+print("Patched build_graph.py: normalized Windows source paths to forward slashes.")
 '@
 $BuildGraphPatch | python -
 if ($LASTEXITCODE -ne 0) {
-    throw "Could not apply the Swofty build_graph.py compatibility patch."
+    throw "Could not apply the Swofty Windows source-path compatibility patch."
 }
 
 Write-Host "Building native C++ loader via native/build.sh..."
