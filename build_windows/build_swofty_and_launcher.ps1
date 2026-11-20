@@ -42,23 +42,32 @@ if ($RustVerRaw -match 'rustc\s+(\d+\.\d+\.\d+)') {
     throw "Could not parse rustc version from: $RustVerRaw"
 }
 
-# Ensure Zig is available
+$RequiredZigVersion = "0.15.2"
 if (-not (Get-Command "zig" -ErrorAction SilentlyContinue)) {
-    Write-Host "Zig not found on PATH; attempting winget install..."
-    if (Get-Command "winget" -ErrorAction SilentlyContinue) {
-        winget install --id zig.zig -e --accept-source-agreements --accept-package-agreements
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-    }
-    if (-not (Get-Command "zig" -ErrorAction SilentlyContinue)) {
-        throw "Zig toolchain is required by Swofty native/build.sh and is not on PATH."
-    }
+    throw "Zig $RequiredZigVersion is required by Swofty native/build-win.sh and is not on PATH."
 }
-Write-Host "Verified Zig version: $(zig version)"
+$ZigVersion = (& zig version).Trim()
+if ($LASTEXITCODE -ne 0 -or $ZigVersion -ne $RequiredZigVersion) {
+    throw "Expected Zig $RequiredZigVersion to match the GitHub Actions workflow, found '$ZigVersion'."
+}
+Write-Host "Verified Zig version: $ZigVersion"
 
 New-Item -ItemType Directory -Force -Path $BuildTmp | Out-Null
 New-Item -ItemType Directory -Force -Path $ShimBin | Out-Null
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 New-Item -ItemType Directory -Force -Path $SwoftyCoreOut | Out-Null
+
+$ZigProbeSource = Join-Path $PSScriptRoot "zig_from_chars_probe.cpp"
+$ZigProbeOutput = Join-Path $env:TEMP "f1classic-zig-from-chars-$PID.o"
+try {
+    & zig c++ -target x86_64-windows-gnu "-std=c++23" -c $ZigProbeSource -o $ZigProbeOutput
+    if ($LASTEXITCODE -ne 0) {
+        throw "Zig $RequiredZigVersion failed the C++23 std::from_chars(double) probe."
+    }
+} finally {
+    Remove-Item -LiteralPath $ZigProbeOutput -Force -ErrorAction SilentlyContinue
+}
+Write-Host "Verified Zig C++23 std::from_chars(double) support for x86_64-windows-gnu."
 
 # Retain a nice shim for non-CI/local builds, but do not shim taskset: upstream probes `taskset -pc` in CI too.
 @'
