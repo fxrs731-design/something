@@ -1,7 +1,7 @@
 import json
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -63,19 +63,59 @@ def _normalize_str_list(val: Any) -> list[str]:
     return []
 
 
+def _relative_package_path(raw: Any, allow_dot: bool = False) -> Path | None:
+    value = str(raw).replace("\\", "/")
+    if allow_dot and value in ("", "."):
+        return Path(".")
+    pure = PurePosixPath(value)
+    if (
+        not value
+        or "\x00" in value
+        or pure.is_absolute()
+        or any(part in ("", ".", "..") for part in pure.parts)
+        or (len(value) > 1 and value[1] == ":")
+    ):
+        return None
+    return Path(*pure.parts)
+
+
+def _is_within(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _normalize_game_name(value: Any) -> str:
+    game = str(value).strip()
+    compact = re.sub(r"[\s_-]+", "", game).lower()
+    if compact in ("f125",):
+        return "F1 25"
+    return game
+
+
 class ManifestParser:
     @staticmethod
-    def parse_package(package_root: Path) -> SeasonManifest:
+    def parse_package(package_root: Path, default_season: int | None = None) -> SeasonManifest:
         manifest_path = package_root / "manifest.json"
         swofty_path = package_root / "swofty.json"
         if manifest_path.is_file():
             return ManifestParser.parse_file(manifest_path, package_root=package_root)
         if swofty_path.is_file():
-            return ManifestParser.parse_swofty_file(swofty_path, package_root=package_root)
+            return ManifestParser.parse_swofty_file(
+                swofty_path,
+                package_root=package_root,
+                default_season=default_season,
+            )
         raise ManifestValidationError(["Missing required manifest.json or swofty.json in package."])
 
     @staticmethod
-    def parse_swofty_file(swofty_path: Path, package_root: Path | None = None) -> SeasonManifest:
+    def parse_swofty_file(
+        swofty_path: Path,
+        package_root: Path | None = None,
+        default_season: int | None = None,
+    ) -> SeasonManifest:
         try:
             raw = json.loads(swofty_path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
@@ -101,11 +141,23 @@ class ManifestParser:
         year_match = re.search(r"(19\d{2}|20\d{2})", f"{name} {pkg_id}")
         raw_season = raw.get("season")
         try:
-            season_year = int(raw_season) if raw_season is not None else int(year_match.group(1) if year_match else 2025)
+            if raw_season is not None:
+                season_year = int(raw_season)
+            else:
+                inferred_year = int(year_match.group(1)) if year_match else None
+                season_year = (
+                    inferred_year
+                    if inferred_year in (2010, 2012)
+                    else default_season or inferred_year or 2025
+                )
         except (ValueError, TypeError):
-            season_year = int(year_match.group(1) if year_match else 2025)
+            season_year = default_season or (int(year_match.group(1)) if year_match else 2025)
 
-        game = str(raw.get("game") or "F1 25").strip()
+        compat = raw.get("compat", {})
+        compat_game = compat.get("game") if isinstance(compat, dict) else None
+        game = _normalize_game_name(raw.get("game") or compat_game or "F1 25")
+        if game.lower() != "f1 25":
+            raise ManifestValidationError([f"Only F1 25 addons are supported; this package targets '{game}'."])
 
         artwork = ""
         if package_root is not None:
@@ -208,6 +260,9 @@ class ManifestParser:
 
         if "season" in raw and not isinstance(raw["season"], int):
             errors.append("'season' must be an integer year (e.g. 2018).")
+        game = _normalize_game_name(raw.get("game", ""))
+        if game.lower() != "f1 25":
+            errors.append(f"Only F1 25 mods are supported; this package targets '{raw.get('game', '')}'.")
 
         operations = raw.get("operations", [])
         if not isinstance(operations, list):
@@ -227,19 +282,28 @@ class ManifestParser:
                     if not op.get("source"):
                         errors.append(f"Operation #{idx + 1} ({op_type}) is missing 'source'.")
                     elif package_root is not None:
-                        src_path = package_root / op["source"]
-                        if not src_path.exists():
+                        source_rel = _relative_package_path(op["source"])
+                        src_path = package_root / source_rel if source_rel else package_root
+                        if not source_rel or not _is_within(package_root, src_path) or not src_path.exists():
                             errors.append(
-                                f"Operation #{idx + 1} source '{op['source']}' does not exist in package."
+                                f"Operation #{idx + 1} source '{op['source']}' is missing or unsafe."
                             )
+                if op_type in ("copy_file", "replace_file", "copy_dir", "extract_zip", "bydanix_merge"):
+                    target_rel = _relative_package_path(op.get("target", "."), allow_dot=True)
+                    if not target_rel:
+                        errors.append(f"Operation #{idx + 1} has an unsafe target path.")
                 if op_type == "mkdir" and not op.get("target"):
                     errors.append(f"Operation #{idx + 1} (mkdir) is missing 'target'.")
 
         artwork_rel = raw.get("artwork", "cover.png")
-        if package_root is not None and artwork_rel:
-            art_path = package_root / artwork_rel
-            if not art_path.exists():
-                errors.append(f"Declared artwork file '{artwork_rel}' not found in package.")
+        if artwork_rel:
+            artwork_path = _relative_package_path(artwork_rel)
+            if not artwork_path:
+                errors.append(f"Artwork path '{artwork_rel}' is unsafe.")
+            elif package_root is not None:
+                art_path = package_root / artwork_path
+                if not _is_within(package_root, art_path) or not art_path.exists():
+                    errors.append(f"Declared artwork file '{artwork_rel}' not found in package.")
 
         if errors:
             raise ManifestValidationError(errors)
@@ -254,7 +318,7 @@ class ManifestParser:
             version=str(raw["version"]).strip(),
             author=str(raw["author"]).strip(),
             description=str(raw["description"]).strip(),
-            game=str(raw["game"]).strip(),
+            game=game,
             season=int(raw["season"]),
             artwork=str(artwork_rel),
             teams=teams if isinstance(teams, list) else [],
@@ -263,5 +327,6 @@ class ManifestParser:
             dependencies=_normalize_str_list(raw.get("dependencies", [])),
             adapter=str(raw.get("adapter", "codemasters_standard")),
             notes=str(raw.get("notes", "")),
+            requires_swofty_core=bool(raw.get("requires_swofty_core", False)),
             raw=raw,
         )

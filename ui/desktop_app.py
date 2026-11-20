@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -59,6 +60,24 @@ class InstallWorker(QThread):
         self.finished_result.emit(res)
 
 
+class SwoftySetupWorker(QThread):
+    finished_result = Signal(dict)
+
+    def __init__(self, bridge, action: str, game_dir: Path | None = None, other_mods: bool = False):
+        super().__init__()
+        self.bridge = bridge
+        self.action = action
+        self.game_dir = game_dir
+        self.other_mods = other_mods
+
+    def run(self):
+        if self.action == "reset" and self.game_dir is not None:
+            result = self.bridge.setup_reset(self.game_dir, self.other_mods)
+        else:
+            result = self.bridge.setup_done()
+        self.finished_result.emit(result)
+
+
 class DropZoneFrame(QFrame):
     dropped_path = Signal(str)
 
@@ -96,6 +115,7 @@ class F1ClassicLauncherWindow(QMainWindow):
         self.ctx = ctx
         self.selected_season_id: str | None = None
         self.worker: InstallWorker | None = None
+        self.setup_worker: SwoftySetupWorker | None = None
 
         self.setWindowTitle("F1 Classic Launcher")
         self.resize(1240, 800)
@@ -236,7 +256,13 @@ class F1ClassicLauncherWindow(QMainWindow):
         game = self.ctx["config"].data.get("default_game", "F1 25")
         res = self.ctx["game_detector"].launch_game(game)
         if res.get("ok"):
-            QMessageBox.information(self, "Game Launched", f"Launched {game} (PID {res['pid']})\n{res['executable']}")
+            QMessageBox.information(
+                self,
+                "F1 25 Launch Requested",
+                f"Started {res.get('profile', 'Swofty-managed')} Swofty process (PID {res['pid']}).\n\n"
+                "The profile preflight passed. Watch the Swofty session console for confirmation that "
+                "mod files were applied and the game started.",
+            )
         else:
             QMessageBox.warning(self, "Launch Failed", res.get("error", "Unknown error"))
         self._refresh_logs()
@@ -561,7 +587,7 @@ class F1ClassicLauncherWindow(QMainWindow):
             play_b = QPushButton(f"Play {m.game}")
             play_b.setObjectName("SuccessBtn")
             play_b.clicked.connect(lambda: self._launch_specific_game(m.game))
-            un_b = QPushButton("Uninstall & Restore")
+            un_b = QPushButton("Deactivate Season")
             un_b.setObjectName("DangerBtn")
             un_b.clicked.connect(lambda: self._uninstall_season(m.id))
             act_row.addWidget(play_b)
@@ -583,6 +609,40 @@ class F1ClassicLauncherWindow(QMainWindow):
         info_col.addLayout(act_row)
         hl.addLayout(info_col, 1)
         self.details_lay.addWidget(hdr)
+
+        active_id = self.ctx["config"].get_active_season("F1 25")
+        active_entry = self.ctx["season_manager"].get_season(active_id) if active_id else None
+        if m.game == "F1 25" and active_entry and active_entry.manifest.season == m.season:
+            addon_ids = self.ctx["mod_installer"].get_season_addon_order(m.season)
+            if addon_ids:
+                order_card = QFrame()
+                order_card.setObjectName("Card")
+                order_layout = QVBoxLayout(order_card)
+                order_title = QLabel(f"{m.season} Swofty Addon Load Order")
+                order_title.setObjectName("SectionTitle")
+                order_layout.addWidget(order_title)
+                order_help = QLabel("Select an addon and move it to change the order Swofty applies the profile.")
+                order_help.setObjectName("MutedText")
+                order_help.setWordWrap(True)
+                order_layout.addWidget(order_help)
+                self.season_addon_order = QListWidget()
+                self.season_addon_order.addItems(addon_ids)
+                self.season_addon_order.setMaximumHeight(min(240, max(72, len(addon_ids) * 34)))
+                order_layout.addWidget(self.season_addon_order)
+                order_buttons = QHBoxLayout()
+                move_up = QPushButton("Move Up")
+                move_up.clicked.connect(lambda: self._move_addon_order_item(-1))
+                move_down = QPushButton("Move Down")
+                move_down.clicked.connect(lambda: self._move_addon_order_item(1))
+                save_order = QPushButton("Apply Load Order")
+                save_order.setObjectName("PrimaryBtn")
+                save_order.clicked.connect(lambda _=False, sid=m.id: self._save_addon_order(sid))
+                order_buttons.addWidget(move_up)
+                order_buttons.addWidget(move_down)
+                order_buttons.addStretch(1)
+                order_buttons.addWidget(save_order)
+                order_layout.addLayout(order_buttons)
+                self.details_lay.addWidget(order_card)
 
         meta_card = QFrame()
         meta_card.setObjectName("Card")
@@ -609,6 +669,34 @@ class F1ClassicLauncherWindow(QMainWindow):
         self.details_lay.addStretch(1)
         self.stack.setCurrentIndex(5)
 
+    def _move_addon_order_item(self, offset: int):
+        widget = getattr(self, "season_addon_order", None)
+        if widget is None:
+            return
+        row = widget.currentRow()
+        destination = row + offset
+        if row < 0 or destination < 0 or destination >= widget.count():
+            return
+        item = widget.takeItem(row)
+        widget.insertItem(destination, item)
+        widget.setCurrentRow(destination)
+
+    def _save_addon_order(self, season_id: str):
+        widget = getattr(self, "season_addon_order", None)
+        if widget is None:
+            return
+        addon_ids = [widget.item(index).text() for index in range(widget.count())]
+        result = self.ctx["mod_installer"].reorder_season_addons(season_id, addon_ids)
+        if result.get("ok"):
+            QMessageBox.information(
+                self,
+                "Load Order Applied",
+                result.get("conflicts") or "Swofty rebuilt the profile with the requested addon order.",
+            )
+        else:
+            QMessageBox.warning(self, "Load Order Failed", result.get("error", "Could not apply the requested addon order."))
+            self._open_season_details(season_id)
+
     # --- Import ---
     def _init_import_page(self):
         lay = QVBoxLayout(self.page_import)
@@ -618,17 +706,29 @@ class F1ClassicLauncherWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("Card")
         cl = QVBoxLayout(card)
-        title = QLabel("Import Season Package (.zip or Folder)")
+        title = QLabel("Import a Swofty Addon or F1 25 Mod")
         title.setObjectName("SectionTitle")
         cl.addWidget(title)
+        instructions = QLabel(
+            "F1 25 folder mods are imported by the official Simplified Importer and become Swofty addons. "
+            "Nested F1 25 game folders are supported; executable and plugin files are excluded by that importer."
+        )
+        instructions.setWordWrap(True)
+        instructions.setObjectName("MutedText")
+        cl.addWidget(instructions)
 
         drop = DropZoneFrame()
         drop.dropped_path.connect(self._run_import)
         cl.addWidget(drop)
 
         row = QHBoxLayout()
+        row.addWidget(QLabel("Season for raw mods:"))
+        self.import_season_combo = QComboBox()
+        self.import_season_combo.addItem("2010", 2010)
+        self.import_season_combo.addItem("2012", 2012)
+        row.addWidget(self.import_season_combo)
         self.import_path_edit = QLineEdit()
-        self.import_path_edit.setPlaceholderText("Select or paste path to a .zip or season folder...")
+        self.import_path_edit.setPlaceholderText("Select or paste a Swofty addon, ZIP, or F1 25 mod folder...")
         b_zip = QPushButton("Browse .zip")
         b_zip.clicked.connect(self._browse_import_zip)
         b_dir = QPushButton("Browse Folder")
@@ -650,22 +750,32 @@ class F1ClassicLauncherWindow(QMainWindow):
         lay.addStretch(1)
 
     def _browse_import_zip(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Season Package (.zip)", "", "ZIP Archives (*.zip);;All Files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Swofty Addon or Mod (.zip)", "", "Packages (*.zip *.swoftyaddon);;All Files (*)")
         if path:
             self.import_path_edit.setText(path)
             self._run_import(path)
 
     def _browse_import_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Season Package Folder")
+        path = QFileDialog.getExistingDirectory(self, "Select Swofty Addon or F1 25 Mod Folder")
         if path:
             self.import_path_edit.setText(path)
             self._run_import(path)
 
     def _run_import(self, path_str: str, allow_update: bool = False):
-        res = self.ctx["package_importer"].import_package(path_str, allow_update=allow_update)
+        season_year = self.import_season_combo.currentData()
+        res = self.ctx["package_importer"].import_package(
+            path_str,
+            allow_update=allow_update,
+            season_year=season_year,
+        )
         if res.get("ok"):
             self.import_status.setText(f"Imported: {res.get('name')} ({res.get('game')})")
-            QMessageBox.information(self, "Import Complete", f"Successfully {res.get('action')}: {res.get('name')}")
+            QMessageBox.information(
+                self,
+                "Import Complete",
+                f"Successfully {res.get('action')}: {res.get('name')}\n"
+                "Activate it from the season page to convert/apply it through Swofty.",
+            )
             self.refresh_all()
         elif res.get("duplicate"):
             reply = QMessageBox.question(
@@ -727,6 +837,34 @@ class F1ClassicLauncherWindow(QMainWindow):
             gl.addLayout(row)
         hl.addWidget(games_card)
 
+        setup_card = QFrame()
+        setup_card.setObjectName("Card")
+        setup_layout = QVBoxLayout(setup_card)
+        setup_title = QLabel("Swofty Modded-Play Setup")
+        setup_title.setObjectName("SectionTitle")
+        setup_text = QLabel(
+            "Before the first modded session, Swofty must restore/record the F1 25 game folder. Verify or repair "
+            "the game through Steam or the EA app if Swofty requests it. Modded sessions run offline without "
+            "EA AntiCheat; vanilla launches do not use this modded path."
+        )
+        setup_text.setWordWrap(True)
+        setup_text.setObjectName("MutedText")
+        setup_layout.addWidget(setup_title)
+        setup_layout.addWidget(setup_text)
+        self.swofty_setup_status_lbl = QLabel("Check Swofty setup status before modded play.")
+        self.swofty_setup_status_lbl.setWordWrap(True)
+        setup_layout.addWidget(self.swofty_setup_status_lbl)
+        setup_buttons = QHBoxLayout()
+        self.swofty_setup_reset_btn = QPushButton("Start Setup Reset")
+        self.swofty_setup_reset_btn.clicked.connect(self._start_swofty_setup_reset)
+        self.swofty_setup_done_btn = QPushButton("Finish Setup")
+        self.swofty_setup_done_btn.setObjectName("PrimaryBtn")
+        self.swofty_setup_done_btn.clicked.connect(self._finish_swofty_setup)
+        setup_buttons.addWidget(self.swofty_setup_reset_btn)
+        setup_buttons.addWidget(self.swofty_setup_done_btn)
+        setup_layout.addLayout(setup_buttons)
+        hl.addWidget(setup_card)
+
         dir_card = QFrame()
         dir_card.setObjectName("Card")
         dl = QVBoxLayout(dir_card)
@@ -768,6 +906,108 @@ class F1ClassicLauncherWindow(QMainWindow):
         found = self.ctx["game_detector"].detect_installed_games()
         self._refresh_settings()
         QMessageBox.information(self, "Auto-Detect", f"Detected {len(found)} game installation(s).")
+
+    def _start_swofty_setup_reset(self):
+        if self.setup_worker and self.setup_worker.isRunning():
+            return
+        game_dir = self.ctx["config"].get_game_path("F1 25")
+        check = self.ctx["game_detector"].validate_game_directory("F1 25", game_dir)
+        if not check["valid"]:
+            QMessageBox.warning(self, "F1 25 Required", check["reason"])
+            return
+
+        status = self.ctx["swofty_bridge"].setup_status()
+        if not status["ok"]:
+            QMessageBox.warning(self, "Swofty Unavailable", status.get("error", status.get("stderr", "Could not read Swofty setup status.")))
+            return
+        if status["done"]:
+            QMessageBox.information(self, "Setup Complete", "Swofty setup is already complete for modded play.")
+            self.swofty_setup_status_lbl.setText(status.get("output", "Swofty setup is complete."))
+            return
+        if "verify the game files" in status.get("output", "").lower():
+            QMessageBox.information(
+                self,
+                "Verify F1 25 Game Files",
+                status["output"] + "\n\nAfter following that instruction, choose “Finish Setup.”",
+            )
+            return
+
+        reset_prompt = QMessageBox.question(
+            self,
+            "Reset F1 25 for Swofty",
+            "Swofty setup restores the game folder to its vanilla state and records a clean baseline. "
+            "The game must be closed. Verify or repair the game files afterward if Swofty requests it. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reset_prompt != QMessageBox.Yes:
+            return
+        other_mods_prompt = QMessageBox.question(
+            self,
+            "Other Game-Folder Mods",
+            "Does the F1 25 folder contain mods that were not installed by Swofty?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        self._start_swofty_setup_worker("reset", Path(check["directory"]), other_mods_prompt == QMessageBox.Yes)
+
+    def _finish_swofty_setup(self):
+        if self.setup_worker and self.setup_worker.isRunning():
+            return
+        status = self.ctx["swofty_bridge"].setup_status()
+        if not status["ok"]:
+            QMessageBox.warning(self, "Swofty Unavailable", status.get("error", status.get("stderr", "Could not read Swofty setup status.")))
+            return
+        if status["done"]:
+            QMessageBox.information(self, "Setup Complete", "Swofty setup is already complete for modded play.")
+            self.swofty_setup_status_lbl.setText(status.get("output", "Swofty setup is complete."))
+            return
+        if "verify the game files" not in status.get("output", "").lower():
+            QMessageBox.warning(
+                self,
+                "Setup Reset Required",
+                "Run the Swofty setup reset first. Swofty has not recorded a reset that is ready to finish.",
+            )
+            return
+        verified = QMessageBox.question(
+            self,
+            "Confirm Game Verification",
+            "Have you completed the Steam verification or EA app repair Swofty requested, or did Swofty say "
+            "there was nothing to verify?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if verified == QMessageBox.Yes:
+            self._start_swofty_setup_worker("done")
+
+    def _start_swofty_setup_worker(self, action: str, game_dir: Path | None = None, other_mods: bool = False):
+        self.swofty_setup_reset_btn.setEnabled(False)
+        self.swofty_setup_done_btn.setEnabled(False)
+        self.swofty_setup_status_lbl.setText("Running Swofty setup...")
+        self.setup_worker = SwoftySetupWorker(
+            self.ctx["swofty_bridge"],
+            action,
+            game_dir,
+            other_mods,
+        )
+        self.setup_worker.finished_result.connect(self._on_swofty_setup_finished)
+        self.setup_worker.start()
+
+    def _on_swofty_setup_finished(self, result: dict):
+        self.swofty_setup_reset_btn.setEnabled(True)
+        self.swofty_setup_done_btn.setEnabled(True)
+        output = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
+        if result.get("ok"):
+            self.swofty_setup_status_lbl.setText(output or "Swofty setup command completed.")
+            QMessageBox.information(
+                self,
+                "Swofty Setup",
+                output or "Swofty setup command completed.",
+            )
+        else:
+            error = output or "Swofty setup command failed."
+            self.swofty_setup_status_lbl.setText(error)
+            QMessageBox.warning(self, "Swofty Setup Failed", error)
 
     def _browse_game_dir(self, game: str):
         path = QFileDialog.getExistingDirectory(self, f"Select {game} Installation Folder")
@@ -837,8 +1077,14 @@ class F1ClassicLauncherWindow(QMainWindow):
     def _on_install_finished(self, res: dict):
         if res.get("ok"):
             self.dash_progress.setValue(100)
-            self.dash_progress_lbl.setText(f"Installed ({res.get('files_modified', 0)} files)")
-            QMessageBox.information(self, "Install Complete", f"Season installed ({res.get('files_modified', 0)} files).")
+            self.dash_progress_lbl.setText(f"Swofty profile ready ({res.get('addon_count', 0)} addons)")
+            conflict_text = res.get("conflicts") or "No conflicts reported."
+            QMessageBox.information(
+                self,
+                "Swofty Profile Ready",
+                f"Season {res.get('season')} is active with {res.get('addon_count', 0)} addon(s).\n\n"
+                f"Swofty conflict check:\n{conflict_text}",
+            )
         else:
             self.dash_progress.setValue(0)
             self.dash_progress_lbl.setText(res.get("error", "Install failed"))
@@ -848,7 +1094,12 @@ class F1ClassicLauncherWindow(QMainWindow):
     def _uninstall_season(self, season_id: str):
         res = self.ctx["mod_installer"].uninstall_season(season_id)
         if res.get("ok"):
-            QMessageBox.information(self, "Uninstalled", f"Restored {res.get('restored', 0)} original files.")
+            QMessageBox.information(
+                self,
+                "Season Deactivated",
+                f"Disabled {res.get('disabled_addons', 0)} Swofty addon(s). "
+                "The imported files remain safely stored in Swofty and can be reactivated.",
+            )
         else:
             QMessageBox.warning(self, "Uninstall Failed", res.get("error", "Unknown error"))
         self.refresh_all()
@@ -864,7 +1115,11 @@ class F1ClassicLauncherWindow(QMainWindow):
     def _launch_specific_game(self, game: str):
         res = self.ctx["game_detector"].launch_game(game)
         if res.get("ok"):
-            QMessageBox.information(self, "Game Launched", f"Launched {game} (PID {res['pid']})")
+            QMessageBox.information(
+                self,
+                "F1 25 Session Started",
+                f"Started {res.get('profile', 'Swofty-managed')} session (PID {res['pid']}).",
+            )
         else:
             QMessageBox.warning(self, "Launch Failed", res.get("error", "Unknown error"))
 

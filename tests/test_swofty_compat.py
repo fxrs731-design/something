@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -17,12 +18,17 @@ class TestSwoftyByDaniXCompat(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="f1classic_swofty_"))
         self.ctx = create_app_context(self.tmp / "launcher_data")
+        self.bridge = Mock()
+        self.bridge.install_addon_package.return_value = {"ok": True}
+        self.bridge.ensure_watermark_addon.return_value = {"ok": True}
+        self.bridge.set_addon_enabled.return_value = {"ok": True}
+        self.bridge.reorder_addons.return_value = {"ok": True}
+        self.bridge.check_conflicts.return_value = {"ok": True, "stdout": "No conflicts found."}
+        self.ctx["mod_installer"].swofty_bridge = self.bridge
 
     def test_season_templates_import_for_f1_25(self):
         supported_games = GameAdapter.list_supported_games()
-        self.assertIn("F1 25", supported_games)
-        self.assertNotIn("F1 2010", supported_games)
-        self.assertNotIn("F1 2012", supported_games)
+        self.assertEqual(supported_games, ["F1 25"])
 
         for year in (2010, 2012):
             with self.subTest(season=year):
@@ -40,94 +46,124 @@ class TestSwoftyByDaniXCompat(unittest.TestCase):
                 self.assertEqual(result["game"], "F1 25")
                 self.assertEqual(result["season"], year)
 
-                entry = self.ctx["season_manager"].get_season(
-                    f"bydanix.f1-{year}-season"
-                )
+                entry = self.ctx["season_manager"].get_season(f"bydanix.f1-{year}-season")
                 self.assertIsNotNone(entry)
                 self.assertEqual(entry.manifest.game, "F1 25")
                 self.assertEqual(entry.manifest.season, year)
 
-    def test_swofty_json_bydanix_folder_import_and_install(self):
-        pkg_2010 = self.tmp / "bydanix.f1-2010-season"
-        (pkg_2010 / "files" / "cars").mkdir(parents=True)
-        (pkg_2010 / "parts").mkdir()
-        (pkg_2010 / "registry").mkdir()
-        (pkg_2010 / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\nICON2010")
-        (pkg_2010 / "files" / "cars" / "rb6.erp").write_text("BYDANIX_2010_RB6", encoding="utf-8")
-        (pkg_2010 / "swofty.json").write_text(json.dumps({
+    def test_swofty_addon_import_preserves_metadata_and_uses_core(self):
+        package = self.tmp / "bydanix.f1-2010-season"
+        (package / "files" / "cars").mkdir(parents=True)
+        (package / "parts").mkdir()
+        (package / "registry").mkdir()
+        (package / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\nICON2010")
+        (package / "files" / "cars" / "rb6.erp").write_text("BYDANIX_2010_RB6", encoding="utf-8")
+        (package / "swofty.json").write_text(json.dumps({
             "id": "bydanix.f1-2010-season",
             "name": "ByDaniX F1 2010 Season",
             "version": "1.0.0",
             "author": "ByDaniX",
             "description": "F1 2010 season mod",
+            "compat": {"game": "f1_25"},
+            "teams": ["Red Bull"],
+            "drivers": ["Sebastian Vettel"],
         }), encoding="utf-8")
 
-        res = self.ctx["package_importer"].import_package(str(pkg_2010))
-        self.assertTrue(res["ok"])
+        result = self.ctx["package_importer"].import_package(str(package))
+        self.assertTrue(result["ok"], result.get("errors"))
         entry = self.ctx["season_manager"].get_season("bydanix.f1-2010-season")
-        self.assertIsNotNone(entry)
         self.assertEqual(entry.manifest.season, 2010)
         self.assertEqual(entry.manifest.game, "F1 25")
-        self.assertIsNotNone(entry.artwork_path)
-        self.assertEqual(entry.artwork_path.name, "icon.png")
+        self.assertEqual(entry.manifest.teams, ["Red Bull"])
+        self.assertEqual(entry.manifest.drivers, ["Sebastian Vettel"])
+        self.assertTrue(entry.manifest.requires_swofty_core)
+        self.assertTrue((entry.package_dir / "swofty.json").is_file())
+        self.assertEqual(json.loads((entry.package_dir / "manifest.json").read_text())["season"], 2010)
 
         game_25 = self.tmp / "Games" / "F1 25"
         game_25.mkdir(parents=True)
         (game_25 / "F1_25.exe").write_text("MOCK_EXE_25", encoding="utf-8")
         self.ctx["config"].set_game_path("F1 25", str(game_25))
+        self.bridge.ensure_watermark_addon.return_value = {"ok": True}
 
-        inst = self.ctx["mod_installer"].install_season("bydanix.f1-2010-season")
-        self.assertTrue(inst["ok"])
-        self.assertTrue((game_25 / "cars" / "rb6.erp").is_file())
-
-        uninst = self.ctx["mod_installer"].uninstall_season("bydanix.f1-2010-season")
-        self.assertTrue(uninst["ok"])
+        activated = self.ctx["mod_installer"].install_season("bydanix.f1-2010-season")
+        self.assertTrue(activated["ok"], activated.get("error"))
+        self.bridge.install_addon_package.assert_called_once_with(
+            entry.package_dir,
+            "bydanix.f1-2010-season",
+            "default",
+        )
         self.assertFalse((game_25 / "cars" / "rb6.erp").exists())
 
-    def test_eaanticheat_launcher_exe_support_for_f1_25(self):
+        deactivated = self.ctx["mod_installer"].uninstall_season("bydanix.f1-2010-season")
+        self.assertTrue(deactivated["ok"], deactivated.get("error"))
+        self.bridge.set_addon_enabled.assert_any_call("bydanix.f1-2010-season", False, "default")
+        self.bridge.set_addon_enabled.assert_any_call("f1classic.launcher", False, "default")
+
+        updated_source = self.tmp / "updated-addon-package"
+        shutil.copytree(entry.package_dir, updated_source)
+        (updated_source / "files" / "cars" / "rb6.erp").write_text("UPDATED_2010_RB6", encoding="utf-8")
+        update_result = self.ctx["package_importer"].import_package(
+            str(updated_source),
+            allow_update=True,
+        )
+        self.assertTrue(update_result["ok"], update_result.get("errors"))
+        self.assertEqual(update_result["version"], "1.0.0")
+        refreshed = self.ctx["mod_installer"].install_season("bydanix.f1-2010-season")
+        self.assertTrue(refreshed["ok"], refreshed.get("error"))
+        self.assertEqual(self.bridge.install_addon_package.call_count, 2)
+
+    def test_f1_25_addon_uses_selected_year_when_metadata_has_no_season(self):
+        package = self.tmp / "modern_carpack"
+        package.mkdir()
+        (package / "swofty.json").write_text(json.dumps({
+            "id": "custom.f125.carpack",
+            "name": "F1 25 Car Pack",
+            "version": "1.0.0",
+            "compat": {"game": "f1_25"},
+        }), encoding="utf-8")
+
+        imported = self.ctx["package_importer"].import_package(str(package), season_year=2012)
+        self.assertTrue(imported["ok"], imported.get("errors"))
+        season = self.ctx["season_manager"].get_season("custom.f125.carpack")
+        self.assertEqual(season.manifest.game, "F1 25")
+        self.assertEqual(season.manifest.season, 2012)
+
+    def test_ea_service_launcher_is_not_mistaken_for_the_game_executable(self):
         game_25 = self.tmp / "Games" / "F1 25 Custom"
         game_25.mkdir(parents=True)
         ea_exe = game_25 / "EAAntiCheat.GameServiceLauncher.exe"
         ea_exe.write_text("MOCK_EA_ANTICHEAT_LAUNCHER", encoding="utf-8")
-        (game_25 / "preloader_l.dll").write_text("MOCK_PRELOADER", encoding="utf-8")
 
-        # Validate by directory
-        check_dir = self.ctx["game_detector"].validate_game_directory("F1 25", str(game_25))
-        self.assertTrue(check_dir["valid"])
-        self.assertEqual(Path(check_dir["executable"]).name, "EAAntiCheat.GameServiceLauncher.exe")
-
-        # Validate by direct .exe path
-        check_exe = self.ctx["game_detector"].validate_game_directory("F1 25", str(ea_exe))
-        self.assertTrue(check_exe["valid"])
-        self.assertEqual(check_exe["directory"], str(game_25))
-        self.assertEqual(check_exe["executable"], str(ea_exe))
-
-
+        result = self.ctx["game_detector"].validate_game_directory("F1 25", str(ea_exe))
+        self.assertFalse(result["valid"])
+        self.assertIn("F1_25.exe", result["reason"])
 
     def test_quoted_path_bom_and_multi_season_folder_import(self):
-        parent = self.tmp / "F1 2010 - 2015 car mod"
-        for yr, slug in ((2010, "bydanix.f1-2010-season"), (2012, "bydanix.f1-2012-season")):
-            d = parent / slug
-            (d / "parts").mkdir(parents=True)
-            (d / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\nICON")
-            # Write with UTF-8 BOM and dict-shaped dependencies/author
-            (d / "swofty.json").write_text(
+        parent = self.tmp / "F1 2010 - 2012 car mod"
+        for year, slug in ((2010, "bydanix.f1-2010-season"), (2012, "bydanix.f1-2012-season")):
+            addon = parent / slug
+            (addon / "parts").mkdir(parents=True)
+            (addon / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\nICON")
+            (addon / "swofty.json").write_text(
                 json.dumps({
                     "id": slug,
-                    "name": f"ByDaniX F1 {yr} Season",
+                    "name": f"ByDaniX F1 {year} Season",
                     "version": "1.0.0",
                     "author": {"name": "ByDaniX"},
+                    "compat": {"game": "f1_25"},
                     "dependencies": {"simplified.for-swofty": ">=1.0.0"},
                 }),
                 encoding="utf-8-sig",
             )
-        # Pass quoted path like Windows Explorer "Copy as path"
-        res = self.ctx["package_importer"].import_package(f'"{parent}"')
-        self.assertTrue(res["ok"])
+
+        result = self.ctx["package_importer"].import_package(f'"{parent}"')
+        self.assertTrue(result["ok"])
         seasons = self.ctx["season_manager"].scan_seasons()
         self.assertEqual(len(seasons), 2)
-        self.assertEqual(seasons[0].manifest.author, "ByDaniX")
-        self.assertIsInstance(seasons[0].manifest.dependencies, list)
+        self.assertEqual({season.manifest.game for season in seasons}, {"F1 25"})
+        self.assertEqual({season.manifest.season for season in seasons}, {2010, 2012})
+        self.assertTrue(all(season.manifest.requires_swofty_core for season in seasons))
 
 
 if __name__ == "__main__":

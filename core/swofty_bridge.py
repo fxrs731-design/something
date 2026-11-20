@@ -1,23 +1,37 @@
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.request
 from pathlib import Path
 
 from core.logger import LauncherLogger
 
 
-class SwoftyBridge:
-    """
-    Integrates with the real Swofty Core CLI/binary and native/dist/ DLLs
-    compiled from https://github.com/Swofty-Developments/SwoftyLauncher.
-    Never fakes execution when the binary is absent.
-    """
+SIMPLIFIED_IMPORTER_REPO = "TeamSimplified/simplified-swofty-addon"
+SIMPLIFIED_IMPORTER_ASSET = "teamsimplified.mods.swoftyaddon"
+SIMPLIFIED_IMPORTER_ID = "teamsimplified.mods"
+WATERMARK_ADDON_ID = "f1classic.launcher"
 
-    def __init__(self, base_dir: Path, logger: LauncherLogger):
+
+class SwoftyBridge:
+    """Runs the bundled Swofty CLI and delegates mod lifecycle to its supported APIs."""
+
+    def __init__(self, base_dir: Path, logger: LauncherLogger, data_dir: Path | None = None):
         self.base_dir = Path(base_dir)
         self.logger = logger
         self.core_dir = self.base_dir / "swofty_core"
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        default_data_dir = (
+            Path(local_app_data) / "F1ClassicLauncher" / "Swofty"
+            if local_app_data
+            else self.base_dir / "swofty_data"
+        )
+        self.data_dir = Path(data_dir) if data_dir else default_data_dir
 
     def find_swofty_cli(self) -> Path | None:
         candidates = [
@@ -25,23 +39,75 @@ class SwoftyBridge:
             self.core_dir / "swofty",
             self.base_dir / "swofty.exe",
         ]
-        for c in candidates:
-            if c.is_file():
-                return c
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
         which_name = "swofty.exe" if sys.platform.startswith("win") else "swofty"
         found = shutil.which(which_name)
         return Path(found) if found else None
 
     def get_native_dist_dir(self) -> Path | None:
-        cand = self.core_dir / "native" / "dist"
-        if cand.is_dir():
-            return cand
-        return None
+        candidate = self.core_dir / "native" / "dist"
+        return candidate if candidate.is_dir() else None
+
+    def get_watermark_addon_dir(self) -> Path:
+        return self.core_dir / "addons" / WATERMARK_ADDON_ID
+
+    def _installed_addon_dir(self, addon_id: str) -> Path:
+        return self.data_dir / "addons" / addon_id
+
+    @staticmethod
+    def content_fingerprint(directory: Path) -> str:
+        root = Path(directory)
+        if not root.is_dir() or root.is_symlink():
+            raise ValueError(f"Addon content directory is missing or invalid: {root}")
+
+        digest = hashlib.sha256()
+        paths = list(root.rglob("*"))
+        if any(path.is_symlink() for path in paths):
+            link = next(path for path in paths if path.is_symlink())
+            raise ValueError(f"Addon content contains a symbolic link: {link}")
+        files = sorted(
+            (path for path in paths if path.is_file()),
+            key=lambda path: path.relative_to(root).as_posix().casefold(),
+        )
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            if relative == ".swofty-files.json":
+                continue
+            encoded_path = relative.encode("utf-8")
+            size = path.stat().st_size
+            digest.update(len(encoded_path).to_bytes(8, "big"))
+            digest.update(encoded_path)
+            digest.update(size.to_bytes(8, "big"))
+            with path.open("rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        return digest.hexdigest()
+
+    def _addon_ids(self) -> set[str]:
+        addons_dir = self.data_dir / "addons"
+        if not addons_dir.is_dir():
+            return set()
+        return {
+            entry.name
+            for entry in addons_dir.iterdir()
+            if entry.is_dir() and (entry / "swofty.json").is_file()
+        }
+
+    def has_addons(self, addon_ids: list[str]) -> bool:
+        installed = self._addon_ids()
+        return bool(addon_ids) and all(addon_id in installed for addon_id in addon_ids)
 
     def get_status(self) -> dict:
         cli = self.find_swofty_cli()
         native_dir = self.get_native_dist_dir()
-        native_dlls = sorted(str(p.relative_to(native_dir)) for p in native_dir.rglob("*.dll")) if native_dir else []
+        native_dlls = sorted(
+            str(path.relative_to(native_dir)) for path in native_dir.rglob("*.dll")
+        ) if native_dir else []
         if not cli:
             return {
                 "available": False,
@@ -49,9 +115,8 @@ class SwoftyBridge:
                 "native_dist_dir": str(native_dir) if native_dir else None,
                 "native_dlls": native_dlls,
                 "message": (
-                    "Swofty Core binary (swofty.exe) not found. "
-                    "Run build_windows/build_swofty_and_launcher.ps1 on Windows (or the GitHub Actions CI workflow) "
-                    "to compile swofty-core and native/dist/ from Swofty-Developments/SwoftyLauncher."
+                    "Swofty Core binary (swofty.exe) not found. Run "
+                    "build_windows/build_swofty_and_launcher.ps1 on Windows or the GitHub Actions workflow."
                 ),
             }
         return {
@@ -62,12 +127,20 @@ class SwoftyBridge:
             "message": f"Swofty Core CLI ready at {cli} ({len(native_dlls)} native DLLs in native/dist)",
         }
 
-    def run_cli(self, args: list[str], cwd: Path | None = None, env_overrides: dict[str, str] | None = None) -> dict:
+    def run_cli(
+        self,
+        args: list[str],
+        cwd: Path | None = None,
+        env_overrides: dict[str, str] | None = None,
+        timeout_seconds: int = 120,
+    ) -> dict:
         cli = self.find_swofty_cli()
         if not cli:
             return {"ok": False, "error": self.get_status()["message"]}
+
         cmd = [str(cli), *args]
         env = os.environ.copy()
+        env["SWOFTY_DATA_DIR"] = str(self.data_dir)
         native_dir = self.get_native_dist_dir()
         if native_dir:
             env["SWOFTY_NATIVE_DIST"] = str(native_dir)
@@ -76,17 +149,351 @@ class SwoftyBridge:
         try:
             proc = subprocess.run(
                 cmd,
-                cwd=str(cwd or self.core_dir if self.core_dir.is_dir() else self.base_dir),
+                cwd=str(cwd or (self.core_dir if self.core_dir.is_dir() else self.base_dir)),
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=timeout_seconds,
             )
+            result = {
+                "ok": proc.returncode == 0,
+                "returncode": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
             if proc.returncode != 0:
-                self.logger.error(f"Swofty CLI failed ({proc.returncode}): {proc.stderr.strip()}")
-                return {"ok": False, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-            self.logger.info(f"Swofty CLI succeeded: {' '.join(cmd)}")
-            return {"ok": True, "returncode": 0, "stdout": proc.stdout, "stderr": proc.stderr}
-        except Exception as exc:
-            self.logger.error(f"Swofty CLI error: {exc}")
+                self.logger.error(
+                    f"Swofty CLI failed ({proc.returncode}): {(proc.stderr or proc.stdout).strip()}"
+                )
+            else:
+                self.logger.info(f"Swofty CLI succeeded: {' '.join(cmd)}")
+            return result
+        except subprocess.TimeoutExpired as exc:
+            self.logger.error(f"Swofty CLI timed out after {timeout_seconds}s: {' '.join(cmd)}")
+            return {
+                "ok": False,
+                "error": f"Swofty command timed out after {timeout_seconds} seconds.",
+                "stdout": exc.stdout or "",
+                "stderr": exc.stderr or "",
+            }
+        except OSError as exc:
+            self.logger.error(f"Could not run Swofty CLI: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    def _install_local_addon(
+        self,
+        addon_id: str,
+        package_dir: Path,
+        profile: str,
+        enable: bool = True,
+    ) -> dict:
+        manifest_path = package_dir / "swofty.json"
+        if not manifest_path.is_file():
+            return {"ok": False, "error": f"Required Swofty addon manifest is missing: {manifest_path}"}
+        try:
+            source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": f"Cannot read addon manifest {manifest_path}: {exc}"}
+        if source_manifest.get("id") != addon_id:
+            return {"ok": False, "error": f"Addon manifest ID must be '{addon_id}'."}
+
+        install = True
+        installed_dir = self._installed_addon_dir(addon_id)
+        installed_manifest = installed_dir / "swofty.json"
+        if installed_manifest.is_file():
+            try:
+                install = self.content_fingerprint(package_dir) != self.content_fingerprint(installed_dir)
+            except (OSError, ValueError) as exc:
+                return {"ok": False, "error": f"Cannot compare addon content for '{addon_id}': {exc}"}
+        if install:
+            result = self.run_cli(["addons", "install", str(package_dir)], timeout_seconds=300)
+            if not result["ok"]:
+                return result
+
+        if not enable:
+            return {"ok": True}
+        enabled = self.run_cli(["--profile", profile, "addons", "enable", addon_id])
+        return enabled
+
+    def ensure_watermark_addon(self, profile: str = "default") -> dict:
+        package_dir = self.get_watermark_addon_dir()
+        dll = package_dir / "native" / "f1classic_watermark.dll"
+        if not dll.is_file():
+            return {
+                "ok": False,
+                "error": (
+                    "The F1 Classic in-game watermark addon is not packaged. "
+                    "Rebuild with build_windows/build_swofty_and_launcher.ps1."
+                ),
+            }
+        result = self._install_local_addon(WATERMARK_ADDON_ID, package_dir, profile)
+        if result["ok"]:
+            self.logger.info("F1 Classic in-game watermark addon is enabled for the Swofty profile.")
+        return result
+
+    def install_addon_package(self, package_dir: Path, addon_id: str, profile: str = "default") -> dict:
+        return self._install_local_addon(addon_id, Path(package_dir), profile, enable=False)
+
+    @staticmethod
+    def _request(url: str, accept: str = "application/octet-stream"):
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": accept, "User-Agent": "F1ClassicLauncher/1.0"},
+        )
+        return urllib.request.urlopen(request, timeout=30)
+
+    def _download_simplified_importer(self) -> dict:
+        metadata_url = f"https://api.github.com/repos/{SIMPLIFIED_IMPORTER_REPO}/releases/latest"
+        try:
+            with self._request(metadata_url, "application/vnd.github+json") as response:
+                release = json.loads(response.read().decode("utf-8"))
+            assets = {asset["name"]: asset for asset in release.get("assets", [])}
+            addon_asset = assets.get(SIMPLIFIED_IMPORTER_ASSET)
+            sums_asset = assets.get("SHA256SUMS")
+            if not addon_asset or not sums_asset:
+                return {"ok": False, "error": "The official Simplified Importer release is missing its addon or checksum."}
+            if addon_asset.get("size", 0) <= 0 or addon_asset["size"] > 250 * 1024 * 1024:
+                return {"ok": False, "error": "The official Simplified Importer release has an unexpected file size."}
+            if not str(addon_asset.get("digest", "")).startswith("sha256:"):
+                return {"ok": False, "error": "GitHub did not provide a SHA-256 digest for the official importer."}
+            if not str(sums_asset.get("digest", "")).startswith("sha256:"):
+                return {"ok": False, "error": "GitHub did not provide a SHA-256 digest for the importer checksums."}
+
+            with self._request(sums_asset["browser_download_url"]) as response:
+                sums_bytes = response.read()
+            sums_hash = hashlib.sha256(sums_bytes).hexdigest()
+            if sums_hash != sums_asset["digest"].removeprefix("sha256:"):
+                return {"ok": False, "error": "The official importer checksum file failed SHA-256 verification."}
+            sums_text = sums_bytes.decode("utf-8")
+            match = re.search(
+                rf"(?m)^([0-9a-fA-F]{{64}})\s+\*?{re.escape(SIMPLIFIED_IMPORTER_ASSET)}\s*$",
+                sums_text,
+            )
+            if not match:
+                return {"ok": False, "error": "The official importer checksum file does not list its addon package."}
+            expected_hash = match.group(1).lower()
+            if expected_hash != addon_asset["digest"].removeprefix("sha256:").lower():
+                return {"ok": False, "error": "GitHub's importer digest does not match the release checksum file."}
+
+            download_dir = self.data_dir / "cache" / "downloads"
+            download_dir.mkdir(parents=True, exist_ok=True)
+            package_path = download_dir / SIMPLIFIED_IMPORTER_ASSET
+            with self._request(addon_asset["browser_download_url"]) as response, tempfile.NamedTemporaryFile(
+                dir=download_dir, prefix="simplified-importer-", suffix=".tmp", delete=False
+            ) as output:
+                temp_path = Path(output.name)
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > addon_asset["size"]:
+                        raise ValueError("The official importer download exceeded its declared size.")
+                    digest.update(chunk)
+                    output.write(chunk)
+            if size != addon_asset["size"] or digest.hexdigest() != expected_hash:
+                temp_path.unlink(missing_ok=True)
+                return {"ok": False, "error": "The official Simplified Importer download failed size or SHA-256 verification."}
+            os.replace(temp_path, package_path)
+            self.logger.info(f"Downloaded verified Simplified Importer {release.get('tag_name', 'latest')}.")
+            return {"ok": True, "path": str(package_path)}
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.logger.error(f"Failed to download the official Simplified Importer: {exc}")
+            return {"ok": False, "error": f"Could not download the official Simplified Importer: {exc}"}
+
+    def ensure_simplified_importer(self, profile: str = "default") -> dict:
+        if not (self._installed_addon_dir(SIMPLIFIED_IMPORTER_ID) / "swofty.json").is_file():
+            download = self._download_simplified_importer()
+            if not download["ok"]:
+                return download
+            installed = self.run_cli(["addons", "install", download["path"]], timeout_seconds=600)
+            if not installed["ok"]:
+                return installed
+        return self.run_cli(
+            ["--profile", profile, "addons", "enable", SIMPLIFIED_IMPORTER_ID],
+            timeout_seconds=300,
+        )
+
+    def register_game(self, game_dir: Path) -> dict:
+        game_dir = Path(game_dir).resolve()
+        listed = self.run_cli(["game", "list"])
+        if not listed["ok"]:
+            return listed
+        normalized_target = str(game_dir).replace("/", "\\").casefold()
+        normalized_output = (listed.get("stdout") or "").replace("/", "\\").casefold()
+        if normalized_target in normalized_output:
+            return {"ok": True, "stdout": listed.get("stdout", "")}
+        return self.run_cli(["game", "add", str(game_dir)], timeout_seconds=300)
+
+    def import_mods(
+        self,
+        source: Path,
+        game_dir: Path,
+        profile: str = "default",
+        known_addon_ids: list[str] | None = None,
+    ) -> dict:
+        importer = self.ensure_simplified_importer(profile)
+        if not importer["ok"]:
+            return importer
+        registered = self.register_game(game_dir)
+        if not registered["ok"]:
+            return registered
+
+        before = self._addon_ids()
+        result = self.run_cli(
+            ["--profile", profile, "mods", "import", str(Path(source).resolve())],
+            timeout_seconds=1800,
+        )
+        if not result["ok"]:
+            return result
+        new_ids = self._addon_ids() - before
+        imported_ids = [
+            path.name
+            for path in sorted(
+                (self.data_dir / "addons" / addon_id for addon_id in new_ids),
+                key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name.casefold()),
+            )
+        ]
+        if not imported_ids:
+            known = list(dict.fromkeys(known_addon_ids or []))
+            if known and all(
+                (self._installed_addon_dir(addon_id) / "swofty.json").is_file()
+                for addon_id in known
+            ):
+                self.logger.info(
+                    "Simplified Importer refreshed existing Swofty addon(s): "
+                    f"{', '.join(known)}"
+                )
+                return {"ok": True, "addon_ids": known, "stdout": result.get("stdout", "")}
+            return {
+                "ok": False,
+                "error": (
+                    "Simplified Importer exited successfully but created no new Swofty addons. "
+                    "The package may already be imported or may not contain supported F1 25 files."
+                ),
+                "stdout": result.get("stdout", ""),
+            }
+        self.logger.info(f"Simplified Importer created Swofty addon(s): {', '.join(imported_ids)}")
+        return {"ok": True, "addon_ids": imported_ids, "stdout": result.get("stdout", "")}
+
+    def set_addon_enabled(self, addon_id: str, enabled: bool, profile: str = "default") -> dict:
+        action = "enable" if enabled else "disable"
+        args = ["--profile", profile, "addons", action, addon_id]
+        if not enabled:
+            args.append("--yes")
+        return self.run_cli(args)
+
+    def reorder_addons(
+        self,
+        addon_ids: list[str],
+        previous_order: list[str] | None = None,
+        profile: str = "default",
+    ) -> dict:
+        ordered = list(dict.fromkeys(addon_ids))
+        previous = list(dict.fromkeys(ordered if previous_order is None else previous_order))
+        for addon_id in ordered:
+            result = self.set_addon_enabled(addon_id, False, profile)
+            if not result["ok"]:
+                for restore_id in previous:
+                    self.set_addon_enabled(restore_id, True, profile)
+                return result
+        for addon_id in ordered:
+            result = self.set_addon_enabled(addon_id, True, profile)
+            if not result["ok"]:
+                for rollback_id in ordered:
+                    self.set_addon_enabled(rollback_id, False, profile)
+                for restore_id in previous:
+                    self.set_addon_enabled(restore_id, True, profile)
+                return result
+        return {"ok": True, "addon_ids": ordered}
+
+    def check_conflicts(self, game_dir: Path, profile: str = "default") -> dict:
+        return self.run_cli(
+            ["--profile", profile, "conflicts", "--check", "--game", str(Path(game_dir).resolve())],
+            timeout_seconds=1800,
+        )
+
+    def setup_status(self) -> dict:
+        result = self.run_cli(["setup", "status"])
+        if not result["ok"]:
+            return result
+        output = (result.get("stdout") or "").strip()
+        return {
+            **result,
+            "done": any(line.strip().lower().startswith("setup: done") for line in output.splitlines()),
+            "output": output,
+        }
+
+    def setup_reset(self, game_dir: Path, other_mods: bool) -> dict:
+        args = ["setup", "reset", "--game", str(Path(game_dir).resolve())]
+        if other_mods:
+            args.append("--other-mods")
+        return self.run_cli(args, timeout_seconds=1800)
+
+    def setup_done(self) -> dict:
+        return self.run_cli(["setup", "done"], timeout_seconds=300)
+
+    def launch_game(self, game_dir: Path, modded: bool) -> dict:
+        game_dir = Path(game_dir).resolve()
+        registered = self.register_game(game_dir)
+        if not registered["ok"]:
+            return {"ok": False, "error": f"Could not register the F1 25 game folder with Swofty: {registered.get('stderr') or registered.get('error')}"}
+
+        if modded:
+            setup = self.setup_status()
+            if not setup["ok"]:
+                return setup
+            if not setup["done"]:
+                return {
+                    "ok": False,
+                    "setup_required": True,
+                    "error": (
+                        "Swofty one-time setup is incomplete. Open Settings & Games, run the setup reset, "
+                        "follow Swofty's game verification or repair instruction (if any), then finish setup "
+                        "before modded play."
+                    ),
+                    "stdout": setup.get("output", ""),
+                }
+            status = self.get_status()
+            if not any(Path(name).name.lower() == "swofty_core.dll" for name in status["native_dlls"]):
+                return {"ok": False, "error": "Swofty Core's native loader DLLs are missing; modded launch is unavailable."}
+            enabled = self.ensure_watermark_addon("default")
+            if not enabled["ok"]:
+                return enabled
+            preflight = self.check_conflicts(game_dir)
+            if not preflight["ok"]:
+                return {
+                    "ok": False,
+                    "error": f"Swofty could not build the enabled F1 25 mods: {preflight.get('stderr') or preflight.get('error')}",
+                    "stdout": preflight.get("stdout", ""),
+                }
+            args = ["--profile", "default", "run", "--apply", "--game", str(game_dir)]
+            self.logger.info(f"Swofty modded F1 25 profile build succeeded: {(preflight.get('stdout') or '').strip()}")
+        else:
+            args = ["game", "launch", "--game", str(game_dir)]
+
+        cli = self.find_swofty_cli()
+        if not cli:
+            return {"ok": False, "error": self.get_status()["message"]}
+        env = os.environ.copy()
+        env["SWOFTY_DATA_DIR"] = str(self.data_dir)
+        native_dir = self.get_native_dist_dir()
+        if native_dir:
+            env["SWOFTY_NATIVE_DIST"] = str(native_dir)
+
+        try:
+            flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if modded and sys.platform.startswith("win") else 0
+            proc = subprocess.Popen(
+                [str(cli), *args],
+                cwd=str(self.core_dir if self.core_dir.is_dir() else self.base_dir),
+                env=env,
+                creationflags=flags,
+            )
+            profile = "default (modded)" if modded else "vanilla (no Swofty mods)"
+            self.logger.info(f"Started Swofty {profile} F1 25 session (PID {proc.pid}).")
+            return {"ok": True, "pid": proc.pid, "profile": profile, "cli_path": str(cli)}
+        except OSError as exc:
+            self.logger.error(f"Failed to start the Swofty F1 25 session: {exc}")
             return {"ok": False, "error": str(exc)}

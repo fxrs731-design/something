@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "f1classic.launcher",
+  "name": "F1 Classic Launcher Watermark",
+  "version": "1.0.0",
+  "author": "F1 Classic Launcher",
+  "kind": ["native"],
+  "compat": {
+    "game": "f1_25"
+  },
+  "requires": [
+    {
+      "id": "swofty.core",
+      "version": ">=0.1.0"
+    }
+  ],
+  "experimental_features": ["overlay"],
+  "operations": {
+    "native": [
+      {
+        "dll": "native/f1classic_watermark.dll"
+      }
+    ]
+  }
+}

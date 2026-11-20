@@ -4,6 +4,8 @@ $RootDir = Split-Path -Parent $PSScriptRoot
 $BuildTmp = Join-Path $RootDir "build_tmp"
 $ShimBin = Join-Path $BuildTmp "shims"
 $SwoftyRepo = Join-Path $BuildTmp "SwoftyLauncher"
+$SwoftyCommit = "873fe1b4dec0bdbacea64b90218d4ff765f28116"
+$SwoftyRemote = "https://github.com/Swofty-Developments/SwoftyLauncher.git"
 $DistDir = Join-Path $RootDir "dist\F1ClassicLauncher_Full"
 $SwoftyCoreOut = Join-Path $DistDir "swofty_core"
 
@@ -69,6 +71,17 @@ try {
 }
 Write-Host "Verified Zig C++23 std::from_chars(double) support for x86_64-windows-gnu."
 
+$WatermarkSource = Join-Path $RootDir "native\f1classic_watermark.cpp"
+$WatermarkManifest = Join-Path $RootDir "swofty_addons\f1classic.launcher\swofty.json"
+$WatermarkPackage = Join-Path $SwoftyCoreOut "addons\f1classic.launcher"
+$WatermarkNativeDir = Join-Path $WatermarkPackage "native"
+$WatermarkDll = Join-Path $WatermarkNativeDir "f1classic_watermark.dll"
+if (-not (Test-Path $WatermarkSource) -or -not (Test-Path $WatermarkManifest)) {
+    throw "The F1 Classic Swofty watermark source or addon manifest is missing."
+}
+New-Item -ItemType Directory -Force -Path $WatermarkNativeDir | Out-Null
+Copy-Item $WatermarkManifest (Join-Path $WatermarkPackage "swofty.json") -Force
+
 # Retain a nice shim for non-CI/local builds, but do not shim taskset: upstream probes `taskset -pc` in CI too.
 @'
 #!/usr/bin/env bash
@@ -90,14 +103,49 @@ exec "$@"
 
 $env:PATH = "$ShimBin;$env:PATH"
 
-# 2. Clone or update Swofty-Developments/SwoftyLauncher
+# 2. Check out the verified Swofty-Developments/SwoftyLauncher revision
 if (-not (Test-Path $SwoftyRepo)) {
-    git clone --depth 1 https://github.com/Swofty-Developments/SwoftyLauncher.git $SwoftyRepo
-} else {
-    Push-Location $SwoftyRepo
-    git pull --ff-only
-    Pop-Location
+    git clone --no-checkout --depth 1 $SwoftyRemote $SwoftyRepo
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to clone SwoftyLauncher."
+    }
 }
+
+if (-not (Test-Path (Join-Path $SwoftyRepo ".git"))) {
+    throw "The cached SwoftyLauncher path is not a Git checkout: $SwoftyRepo"
+}
+$CachedRemote = (git -C $SwoftyRepo remote get-url origin).Trim()
+if ($LASTEXITCODE -ne 0 -or $CachedRemote -ne $SwoftyRemote) {
+    throw "The cached SwoftyLauncher checkout has an unexpected origin: '$CachedRemote'."
+}
+$CachedHead = (git -C $SwoftyRepo rev-parse HEAD 2>$null)
+if ($LASTEXITCODE -eq 0) {
+    $CachedHead = $CachedHead.Trim()
+    if ($CachedHead -ne $SwoftyCommit) {
+        $CachedChanges = git -C $SwoftyRepo status --porcelain
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect the cached SwoftyLauncher worktree."
+        }
+        if ($CachedChanges) {
+            throw "The cached SwoftyLauncher checkout has local changes and is not pinned to $SwoftyCommit. Preserve or clear that cache before rebuilding."
+        }
+    }
+}
+if ($CachedHead -ne $SwoftyCommit) {
+    git -C $SwoftyRepo fetch --depth 1 origin $SwoftyCommit
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to fetch pinned SwoftyLauncher commit $SwoftyCommit."
+    }
+    git -C $SwoftyRepo checkout --detach $SwoftyCommit
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to check out pinned SwoftyLauncher commit $SwoftyCommit."
+    }
+}
+$CheckedOutSwoftyCommit = (git -C $SwoftyRepo rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $CheckedOutSwoftyCommit -ne $SwoftyCommit) {
+    throw "SwoftyLauncher checkout mismatch: expected $SwoftyCommit, found '$CheckedOutSwoftyCommit'."
+}
+Write-Host "Verified SwoftyLauncher commit: $CheckedOutSwoftyCommit"
 
 # 3. Compile Swofty CLI + swofty-core (Rust) and native C++ loader DLLs
 Push-Location $SwoftyRepo
@@ -149,6 +197,25 @@ if (-not (Test-Path "native\build-win.sh")) {
 }
 Write-Host "Building native C++ loader via native/build-win.sh..."
 bash native/build-win.sh
+
+$SdkInclude = Join-Path $SwoftyRepo "packages\sdk\include"
+if (-not (Test-Path $SdkInclude)) {
+    throw "Swofty SDK headers not found at: $SdkInclude"
+}
+Write-Host "Building the F1 Classic in-game watermark addon..."
+& zig c++ -target x86_64-windows-gnu -std=c++23 -O2 -Wall -Wextra -I $SdkInclude -shared -s -o $WatermarkDll $WatermarkSource
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $WatermarkDll)) {
+    throw "Failed to compile the F1 Classic Swofty overlay addon."
+}
+$WatermarkBytes = [System.IO.File]::ReadAllBytes($WatermarkDll)
+if ($WatermarkBytes.Length -lt 64 -or $WatermarkBytes[0] -ne 0x4D -or $WatermarkBytes[1] -ne 0x5A) {
+    throw "Invalid PE header in $WatermarkDll"
+}
+$WatermarkPeOffset = [BitConverter]::ToInt32($WatermarkBytes, 0x3C)
+$WatermarkMachine = [BitConverter]::ToUInt16($WatermarkBytes, $WatermarkPeOffset + 4)
+if ($WatermarkMachine -ne 0x8664) {
+    throw "Watermark addon is not x86_64 (machine=0x$($WatermarkMachine.ToString('X4')))"
+}
 
 $NativeDistDir = Join-Path $SwoftyRepo "native\dist"
 if (-not (Test-Path $NativeDistDir)) {
@@ -243,9 +310,15 @@ status = bridge.get_status()
 assert status['available'], f'Bridge did not detect swofty.exe: {status}'
 assert status['native_dlls'], f'No native DLLs detected in native/dist: {status}'
 
-res = bridge.run_cli(['doctor'], env_overrides={'SWOFTY_DATA_DIR': r'$TempDataDir'})
+env = {'SWOFTY_DATA_DIR': r'$TempDataDir'}
+res = bridge.run_cli(['doctor'], env_overrides=env)
 print('doctor rc:', res.get('returncode'), 'stdout:', (res.get('stdout') or '')[:300])
 assert res.get('returncode') is not None, f'CLI failed to execute: {res}'
+addon = dist_dir / 'swofty_core' / 'addons' / 'f1classic.launcher'
+installed = bridge.run_cli(['--profile', 'default', 'addons', 'install', str(addon)], env_overrides=env)
+assert installed.get('ok'), f'Watermark addon install failed: {installed}'
+enabled = bridge.run_cli(['--profile', 'default', 'addons', 'enable', 'f1classic.launcher'], env_overrides=env)
+assert enabled.get('ok'), f'Watermark addon enable failed: {enabled}'
 print('SwoftyBridge integration verified:', status['cli_path'], 'DLLs:', status['native_dlls'])
 "@
 python -c $VerifyPy

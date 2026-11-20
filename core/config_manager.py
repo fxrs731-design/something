@@ -9,16 +9,19 @@ class ConfigManager:
         self.config_dir = self.base_dir / "config"
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.config_file = self.config_dir / "settings.json"
-
         self.default_config: dict[str, Any] = {
             "seasons_dir": str(self.base_dir / "seasons"),
             "backups_dir": str(self.base_dir / "backups"),
             "imports_dir": str(self.base_dir / "imports"),
             "logs_dir": str(self.base_dir / "logs"),
+            "swofty_data_dir": str(self.base_dir / "Swofty"),
             "default_game": "F1 25",
             "game_paths": {},
             "game_executables": {},
             "active_seasons": {},
+            "season_addons": {},
+            "season_addon_fingerprints": {},
+            "season_addon_orders": {},
             "appearance": {
                 "theme": "f1-dark",
                 "accent": "#e10600",
@@ -51,7 +54,7 @@ class ConfigManager:
         self.config_file.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
 
     def ensure_directories(self):
-        for key in ("seasons_dir", "backups_dir", "imports_dir", "logs_dir"):
+        for key in ("seasons_dir", "backups_dir", "imports_dir", "logs_dir", "swofty_data_dir"):
             Path(self.data[key]).mkdir(parents=True, exist_ok=True)
 
     def get_game_path(self, game_name: str) -> str:

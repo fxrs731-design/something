@@ -12,20 +12,7 @@ class GameProfile:
 
 
 GAME_PROFILES: dict[str, GameProfile] = {
-    "F1 2011": GameProfile("F1 2011", ("F1_2011.exe", "f1_2011.exe"), ("cars", "tracks", "database"), "44360", "ego-classic"),
-    "F1 2013": GameProfile("F1 2013", ("F1_2013.exe", "f1_2013.exe"), ("cars", "tracks", "database"), "223670", "ego-classic"),
-    "F1 2014": GameProfile("F1 2014", ("F1_2014.exe", "f1_2014.exe"), ("cars", "tracks", "database"), "226580", "ego-classic"),
-    "F1 2015": GameProfile("F1 2015", ("F1_2015.exe",), ("asset_groups",), "286570", "ego-modern"),
-    "F1 2016": GameProfile("F1 2016", ("F1_2016.exe",), ("asset_groups",), "391040", "ego-modern"),
-    "F1 2017": GameProfile("F1 2017", ("F1_2017.exe",), ("asset_groups",), "515220", "ego-modern"),
-    "F1 2018": GameProfile("F1 2018", ("F1_2018.exe", "F1_2018_dx12.exe"), ("asset_groups",), "737800", "ego-modern"),
-    "F1 2019": GameProfile("F1 2019", ("F1_2019.exe", "F1_2019_dx12.exe"), ("asset_groups",), "928600", "ego-modern"),
-    "F1 2020": GameProfile("F1 2020", ("F1_2020.exe", "F1_2020_dx12.exe"), ("asset_groups",), "1080110", "ego-modern"),
-    "F1 2021": GameProfile("F1 2021", ("F1_2021_dx12.exe", "F1_2021.exe"), ("asset_groups",), "1134570", "ego-modern"),
-    "F1 22": GameProfile("F1 22", ("F1_22.exe", "EAAntiCheat.GameServiceLauncher.exe"), ("asset_groups",), "1692250", "ego-modern"),
-    "F1 23": GameProfile("F1 23", ("F1_23.exe", "EAAntiCheat.GameServiceLauncher.exe"), ("asset_groups",), "2108330", "ego-modern"),
-    "F1 24": GameProfile("F1 24", ("F1_24.exe", "EAAntiCheat.GameServiceLauncher.exe"), ("asset_groups",), "2488620", "ego-modern"),
-    "F1 25": GameProfile("F1 25", ("EAAntiCheat.GameServiceLauncher.exe", "F1_25.exe"), ("asset_groups",), "3059520", "ego-modern"),
+    "F1 25": GameProfile("F1 25", ("F1_25.exe",), ("asset_groups",), "3059520", "ego-modern"),
 }
 
 
@@ -65,7 +52,4 @@ class GameAdapter:
                 candidate = game_dir / exe
                 if candidate.is_file():
                     return candidate
-        for candidate in game_dir.glob("*.exe"):
-            if "f1" in candidate.name.lower() or "eaanticheat" in candidate.name.lower():
-                return candidate
         return None
