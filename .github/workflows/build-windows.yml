@@ -1,9 +1,9 @@
-name: Build F1 Classic Launcher (Windows)
+name: Build F1 Classic Launcher (Native Windows Desktop)
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, "fix/windows-build-setup" ]
+    branches: [ "fix/windows-build-setup" ]
 
 jobs:
   build-windows:
@@ -12,35 +12,47 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Verify Python
-        shell: pwsh
-        run: python --version
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Run automated tests
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install desktop dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run Python tests
+        run: python -m unittest discover -s . -p "test_*.py" -v
+
+      - name: Build native desktop launcher and Swofty components
+        shell: pwsh
+        run: ./build_windows/build_swofty_and_launcher.ps1
+
+      - name: Verify portable release
         shell: pwsh
         run: |
-          python -m unittest discover -s . -p "test_*.py" -v
-          if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
+          $ReleaseDir = "dist/F1ClassicLauncher_Full"
+          if (!(Test-Path "$ReleaseDir/F1ClassicLauncher.exe")) { throw "F1ClassicLauncher.exe missing." }
+          if (!(Test-Path "$ReleaseDir/swofty_core/swofty.exe")) { throw "Swofty executable missing." }
+          if (!(Test-Path "$ReleaseDir/swofty_core/native/dist")) { throw "Swofty native output missing." }
 
-      - name: Build Windows executable
+      - name: Package Windows release
         shell: pwsh
-        run: ./build_windows/build_launcher.ps1
+        run: Compress-Archive -Path dist/F1ClassicLauncher_Full/* -DestinationPath F1ClassicLauncher_Windows_Full.zip -Force
 
-      - name: Package portable release
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist/F1ClassicLauncher_Windows/* -DestinationPath F1ClassicLauncher_Windows.zip -Force
-          if (!(Test-Path F1ClassicLauncher_Windows.zip)) { throw "Release ZIP was not created." }
-
-      - name: Upload Windows release
+      - name: Upload Windows release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: F1ClassicLauncher_Windows
-          path: F1ClassicLauncher_Windows.zip
+          name: F1ClassicLauncher_Windows_Full
+          path: F1ClassicLauncher_Windows_Full.zip
           if-no-files-found: error
           retention-days: 14
