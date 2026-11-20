@@ -103,8 +103,20 @@ old = "found.append(os.path.relpath(os.path.join(dirpath, name), NATIVE))"
 new = "found.append(os.path.relpath(os.path.join(dirpath, name), NATIVE).replace(os.sep, '/'))"
 if old not in s:
     raise SystemExit("Expected source-discovery line was not found; refusing to patch.")
-p.write_text(s.replace(old, new), encoding="utf-8")
-print("Patched build_graph.py: normalized Windows source paths to forward slashes.")
+s = s.replace(old, new)
+
+# Zig's Windows driver is receiving the SDK include path as an input filename
+# when Ninja expands the joined -I../... form. Keep the option and path separate.
+replacements = {
+    "['-I$sdk', '-Iinclude'": "['-I', '$sdk', '-Iinclude'",
+    "['-Isrc', '-I$sdk']": "['-Isrc', '-I', '$sdk']",
+    "'-Isrc', '-I$sdk', '-Iinclude'": "'-Isrc', '-I', '$sdk', '-Iinclude'",
+}
+for before, after in replacements.items():
+    if before in s:
+        s = s.replace(before, after)
+p.write_text(s, encoding="utf-8")
+print("Patched build_graph.py: normalized source paths and split Zig SDK include arguments.")
 '@
 $BuildGraphPatch | python -
 if ($LASTEXITCODE -ne 0) {
