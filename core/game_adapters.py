@@ -12,9 +12,7 @@ class GameProfile:
 
 
 GAME_PROFILES: dict[str, GameProfile] = {
-    "F1 2010": GameProfile("F1 2010", ("F1_2010.exe", "f1_2010.exe"), ("cars", "tracks", "database"), "44310", "ego-classic"),
     "F1 2011": GameProfile("F1 2011", ("F1_2011.exe", "f1_2011.exe"), ("cars", "tracks", "database"), "44360", "ego-classic"),
-    "F1 2012": GameProfile("F1 2012", ("F1_2012.exe", "f1_2012.exe"), ("cars", "tracks", "database"), "208500", "ego-classic"),
     "F1 2013": GameProfile("F1 2013", ("F1_2013.exe", "f1_2013.exe"), ("cars", "tracks", "database"), "223670", "ego-classic"),
     "F1 2014": GameProfile("F1 2014", ("F1_2014.exe", "f1_2014.exe"), ("cars", "tracks", "database"), "226580", "ego-classic"),
     "F1 2015": GameProfile("F1 2015", ("F1_2015.exe",), ("asset_groups",), "286570", "ego-modern"),

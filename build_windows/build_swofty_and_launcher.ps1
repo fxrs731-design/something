@@ -16,6 +16,20 @@ foreach ($cmd in @("git", "cargo", "rustc", "python", "bash")) {
     }
 }
 
+if (-not (Get-Command "ninja" -ErrorAction SilentlyContinue)) {
+    Write-Host "Ninja not found on PATH; installing the Python-distributed Ninja executable..."
+    python -m pip install --upgrade ninja
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install Ninja."
+    }
+    $PythonScripts = (python -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
+    $env:PATH = "$PythonScripts;$env:PATH"
+}
+if (-not (Get-Command "ninja" -ErrorAction SilentlyContinue)) {
+    throw "Ninja is required by Swofty native/build-win.sh and is not on PATH."
+}
+Write-Host "Verified Ninja version: $(ninja --version)"
+
 # Enforce Rust >= 1.95.0 (per SwoftyLauncher Cargo.toml rust-version = "1.95")
 $RustVerRaw = (rustc --version)
 if ($RustVerRaw -match 'rustc\s+(\d+\.\d+\.\d+)') {
@@ -46,22 +60,7 @@ New-Item -ItemType Directory -Force -Path $ShimBin | Out-Null
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 New-Item -ItemType Directory -Force -Path $SwoftyCoreOut | Out-Null
 
-# Create Windows Git Bash shims for Linux-only utilities (taskset, nice)
-@'
-#!/usr/bin/env bash
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -c|-p|-a|--cpu-list|--pid|--all-tasks)
-      shift 2
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
-exec "$@"
-'@ | Set-Content -Path (Join-Path $ShimBin "taskset") -Encoding Ascii -NoNewline
-
+# Retain a nice shim for non-CI/local builds, but do not shim taskset: upstream probes `taskset -pc` in CI too.
 @'
 #!/usr/bin/env bash
 while [ $# -gt 0 ]; do
@@ -98,6 +97,15 @@ if (-not (Test-Path $CliManifest)) {
     throw "Expected CLI manifest not found at: $CliManifest"
 }
 
+$BuildGraph = Join-Path $SwoftyRepo "native\tools\build_graph.py"
+if (-not (Test-Path $BuildGraph)) {
+    throw "Expected native/tools/build_graph.py not found at: $BuildGraph"
+}
+python (Join-Path $PSScriptRoot "patch_swofty_build.py") $BuildGraph
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to apply verified Windows compatibility fixes to Swofty build_graph.py."
+}
+
 Write-Host "Building Swofty CLI via $CliManifest..."
 cargo build --release --manifest-path $CliManifest
 
@@ -123,8 +131,11 @@ if (Test-Path "THIRD_PARTY.md") {
 if (-not (Test-Path "native\build.sh")) {
     throw "Expected native/build.sh not found in SwoftyLauncher repository."
 }
-Write-Host "Building native C++ loader via native/build.sh..."
-bash native/build.sh
+if (-not (Test-Path "native\build-win.sh")) {
+    throw "Expected native/build-win.sh not found in SwoftyLauncher repository."
+}
+Write-Host "Building native C++ loader via native/build-win.sh..."
+bash native/build-win.sh
 
 $NativeDistDir = Join-Path $SwoftyRepo "native\dist"
 if (-not (Test-Path $NativeDistDir)) {

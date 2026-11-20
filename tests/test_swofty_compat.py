@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -9,12 +10,42 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from main import create_app_context
+from core.game_adapters import GameAdapter
 
 
 class TestSwoftyByDaniXCompat(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="f1classic_swofty_"))
         self.ctx = create_app_context(self.tmp / "launcher_data")
+
+    def test_season_templates_import_for_f1_25(self):
+        supported_games = GameAdapter.list_supported_games()
+        self.assertIn("F1 25", supported_games)
+        self.assertNotIn("F1 2010", supported_games)
+        self.assertNotIn("F1 2012", supported_games)
+
+        for year in (2010, 2012):
+            with self.subTest(season=year):
+                package_dir = self.tmp / f"f1-{year}-template"
+                package_dir.mkdir()
+                (package_dir / "mod_files").mkdir()
+                (package_dir / "cover.png").write_bytes(b"\x89PNG\r\n\x1a\nCOVER")
+                shutil.copyfile(
+                    ROOT_DIR / f"bydanix_f1_{year}_manifest_template.json",
+                    package_dir / "manifest.json",
+                )
+
+                result = self.ctx["package_importer"].import_package(str(package_dir))
+                self.assertTrue(result["ok"], result.get("errors"))
+                self.assertEqual(result["game"], "F1 25")
+                self.assertEqual(result["season"], year)
+
+                entry = self.ctx["season_manager"].get_season(
+                    f"bydanix.f1-{year}-season"
+                )
+                self.assertIsNotNone(entry)
+                self.assertEqual(entry.manifest.game, "F1 25")
+                self.assertEqual(entry.manifest.season, year)
 
     def test_swofty_json_bydanix_folder_import_and_install(self):
         pkg_2010 = self.tmp / "bydanix.f1-2010-season"

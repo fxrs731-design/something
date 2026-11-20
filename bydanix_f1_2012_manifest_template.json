@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "ByDaniX",
   "description": "Template manifest for integrating the ByDaniX F1 2012 season mod once actual mod files are supplied.",
-  "game": "F1 2012",
+  "game": "F1 25",
   "season": 2012,
   "artwork": "cover.png",
   "adapter": "bydanix_legacy",
