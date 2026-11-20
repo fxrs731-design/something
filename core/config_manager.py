@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +21,14 @@ class ConfigManager:
             "game_paths": {},
             "game_executables": {},
             "active_seasons": {},
+            "external_launch_enabled": False,
+            "external_launch_profile": None,
             "season_addons": {},
             "season_addon_fingerprints": {},
             "season_addon_orders": {},
+            "swofty_direct_addons": {},
+            "swofty_mod_enabled_overrides": {},
+            "selected_swofty_profile_year": 2010,
             "appearance": {
                 "theme": "f1-dark",
                 "accent": "#e10600",
@@ -40,18 +47,37 @@ class ConfigManager:
         if self.config_file.exists():
             try:
                 loaded = json.loads(self.config_file.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("settings must be a JSON object")
                 merged = dict(self.default_config)
                 merged.update(loaded)
                 return merged
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise RuntimeError(f"Could not load launcher settings from {self.config_file}: {exc}") from exc
         self.save(self.default_config)
         return dict(self.default_config)
 
     def save(self, data: dict[str, Any] | None = None):
         if data is not None:
             self.data = data
-        self.config_file.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.config_dir,
+                prefix=".settings-",
+                suffix=".tmp",
+                delete=False,
+            ) as output:
+                temp_path = Path(output.name)
+                json.dump(self.data, output, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_path, self.config_file)
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink()
 
     def ensure_directories(self):
         for key in ("seasons_dir", "backups_dir", "imports_dir", "logs_dir", "swofty_data_dir"):
@@ -80,4 +106,19 @@ class ConfigManager:
             active.pop(game_name, None)
         else:
             active[game_name] = season_id
+        self.save()
+
+    def get_external_launch_enabled(self) -> bool:
+        return bool(self.data.get("external_launch_enabled", False))
+
+    def set_external_launch_enabled(self, enabled: bool):
+        self.data["external_launch_enabled"] = bool(enabled)
+        self.save()
+
+    def get_external_launch_profile(self) -> str | None:
+        profile_id = self.data.get("external_launch_profile")
+        return profile_id if isinstance(profile_id, str) and profile_id else None
+
+    def set_external_launch_profile(self, profile_id: str | None):
+        self.data["external_launch_profile"] = profile_id
         self.save()

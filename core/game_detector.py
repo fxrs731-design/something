@@ -28,6 +28,21 @@ class GameDetector:
 
         p = Path(directory_or_exe)
         if p.is_file() and p.suffix.lower() == ".exe":
+            if p.name.lower() == "eaanticheat.gameservicelauncher.exe":
+                game_exe = p.parent / "F1_25.exe"
+                if not game_exe.is_file():
+                    return {
+                        "valid": False,
+                        "executable": None,
+                        "directory": str(p.parent),
+                        "reason": "F1_25.exe was not found beside the EA AntiCheat game-service launcher.",
+                    }
+                return {
+                    "valid": True,
+                    "executable": str(game_exe),
+                    "directory": str(p.parent),
+                    "reason": "Valid F1 25 installation; launching through Swofty's official EA app path.",
+                }
             if p.name.lower() != "f1_25.exe":
                 return {
                     "valid": False,
@@ -89,6 +104,7 @@ class GameDetector:
             pref_exe = self.config.get_game_executable(game_name)
             if configured and self.validate_game_directory(game_name, configured, preferred_exe=pref_exe)["valid"]:
                 detected[game_name] = configured
+                self.logger.info(f"Verified configured {game_name} installation at {configured}.")
                 continue
 
             folder_variants = [game_name, game_name.replace(" ", "_"), game_name.replace(" ", "")]
@@ -105,17 +121,26 @@ class GameDetector:
                 if game_name in detected:
                     break
 
+        if not detected:
+            self.logger.info("F1 25 was not detected in the configured or standard installation folders.")
         return detected
 
     def launch_game(self, game_name: str, extra_args: list[str] | None = None) -> dict:
+        self.logger.info(f"Requested launch of {game_name}.")
         if game_name != "F1 25":
             return {"ok": False, "error": "Only F1 25 can be launched by F1 Classic Launcher."}
         if not self.swofty_bridge:
             return {"ok": False, "error": "Swofty Core is required to launch F1 25 through this launcher."}
+        if extra_args:
+            return {
+                "ok": False,
+                "error": "Custom launch arguments are not supported by the verified EA AntiCheat launch path.",
+            }
         game_dir_str = self.config.get_game_path(game_name)
         pref_exe = self.config.get_game_executable(game_name)
         check = self.validate_game_directory(game_name, game_dir_str, preferred_exe=pref_exe)
         if not check["valid"]:
+            self.logger.error(f"F1 25 launch validation failed: {check['reason']}")
             return {"ok": False, "error": check["reason"]}
         active_id = self.config.get_active_season(game_name)
         if (
@@ -131,5 +156,17 @@ class GameDetector:
                     "to import it through Swofty."
                 ),
             }
-        modded = active_id is not None
-        return self.swofty_bridge.launch_game(Path(check["directory"]), modded=modded)
+        if active_id is not None:
+            self.logger.warning("Blocked modded F1 25 launch because the pinned Swofty path runs without EA AntiCheat.")
+            return {
+                "ok": False,
+                "error": (
+                    "Modded launch is blocked because the pinned Swofty `run --apply` path launches F1 25 "
+                    "without EA AntiCheat. Deactivate the season to launch F1 25 through the official EA app "
+                    "and EA AntiCheat path."
+                ),
+            }
+        result = self.swofty_bridge.launch_game(Path(check["directory"]), modded=False)
+        if not result.get("ok"):
+            self.logger.error(f"F1 25 launch failed: {result.get('error', 'Unknown error')}")
+        return result

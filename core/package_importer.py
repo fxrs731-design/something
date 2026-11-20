@@ -63,10 +63,11 @@ class PackageImporter:
         return found
 
     @staticmethod
-    def _safe_extract(zf: zipfile.ZipFile, destination: Path):
+    def _safe_extract(zf: zipfile.ZipFile, destination: Path, progress_cb=None, progress_start: int = 0, progress_end: int = 100):
         destination.mkdir(parents=True, exist_ok=True)
         root = destination.resolve()
-        for member in zf.infolist():
+        members = zf.infolist()
+        for index, member in enumerate(members):
             raw_name = member.filename.replace("\\", "/")
             pure = PurePosixPath(raw_name)
             parts = [part for part in pure.parts if part not in ("", ".")]
@@ -93,11 +94,15 @@ class PackageImporter:
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(member) as source, target.open("wb") as output:
                 shutil.copyfileobj(source, output)
+            if progress_cb:
+                percent = progress_start + int((index + 1) / max(len(members), 1) * (progress_end - progress_start))
+                progress_cb(percent, f"Extracting package ({index + 1}/{len(members)} entries)...")
 
     @staticmethod
-    def _copy_raw_folder(source: Path, destination: Path):
+    def _copy_raw_folder(source: Path, destination: Path, progress_cb=None, progress_start: int = 0, progress_end: int = 100):
         destination.mkdir(parents=True, exist_ok=True)
-        for item in source.rglob("*"):
+        files = list(source.rglob("*"))
+        for index, item in enumerate(files):
             if item.is_symlink():
                 raise ValueError(f"Symbolic links are not allowed in imported mod folders: {item}")
             if not item.is_file():
@@ -106,6 +111,9 @@ class PackageImporter:
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
+            if progress_cb and item.is_file():
+                percent = progress_start + int((index + 1) / max(len(files), 1) * (progress_end - progress_start))
+                progress_cb(percent, f"Copying mod files ({index + 1}/{len(files)} entries)...")
 
     def _import_raw_mod(
         self,
@@ -113,6 +121,7 @@ class PackageImporter:
         season_year: int | None,
         allow_update: bool,
         display_name: str | None = None,
+        progress_cb=None,
     ) -> dict:
         if season_year not in (2010, 2012):
             return {"ok": False, "errors": ["Choose whether this F1 25 mod belongs to the 2010 or 2012 season."]}
@@ -123,14 +132,18 @@ class PackageImporter:
             package_root = Path(temp) / "package"
             mod_source = package_root / "mod_source"
             try:
+                if progress_cb:
+                    progress_cb(5, "Extracting or copying raw mod files...")
                 if source.is_file():
                     with zipfile.ZipFile(source, "r") as zf:
-                        self._safe_extract(zf, mod_source)
+                        self._safe_extract(zf, mod_source, progress_cb, 5, 50)
                 else:
-                    self._copy_raw_folder(source, mod_source)
+                    self._copy_raw_folder(source, mod_source, progress_cb, 5, 50)
                 if not any(path.is_file() for path in mod_source.rglob("*")):
                     return {"ok": False, "errors": ["The selected mod archive or folder contains no files."]}
 
+                if progress_cb:
+                    progress_cb(60, "Validating raw F1 25 mod files...")
                 manifest = {
                     "schema_version": 1,
                     "id": f"f1classic.mod.{season_year}.{slug}",
@@ -144,12 +157,16 @@ class PackageImporter:
                     "operations": [{"type": "bydanix_merge", "source": "mod_source", "target": "."}],
                 }
                 (package_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-                result = self._import_single_root(package_root, allow_update=allow_update)
+                result = self._import_single_root(
+                    package_root,
+                    allow_update=allow_update,
+                    progress_cb=progress_cb,
+                )
                 if result.get("ok"):
                     result["import_type"] = "raw_f1_25_mod"
                 return result
             except (OSError, zipfile.BadZipFile, ValueError) as exc:
-                self.logger.error(f"Could not stage raw mod '{name}': {exc}")
+                self.logger.exception(f"Could not stage raw mod '{name}': {exc}")
                 return {"ok": False, "errors": [str(exc)]}
 
     def _import_single_root(
@@ -157,6 +174,7 @@ class PackageImporter:
         pkg_root: Path,
         allow_update: bool,
         default_season: int | None = None,
+        progress_cb=None,
     ) -> dict:
         manifest = ManifestParser.parse_package(pkg_root, default_season=default_season)
         existing = self.season_manager.get_season(manifest.id)
@@ -188,6 +206,8 @@ class PackageImporter:
         with tempfile.TemporaryDirectory(prefix=".f1classic-import-", dir=dest_dir.parent) as temp:
             temp_root = Path(temp)
             staged_dir = temp_root / "package"
+            if progress_cb:
+                progress_cb(75, f"Copying package '{manifest.name}' into launcher storage...")
             shutil.copytree(pkg_root, staged_dir)
             if not (pkg_root / "manifest.json").is_file() and (pkg_root / "swofty.json").is_file():
                 launcher_manifest = {
@@ -223,6 +243,8 @@ class PackageImporter:
                 raise
 
         action = "Updated" if existing else "Imported"
+        if progress_cb:
+            progress_cb(95, f"Finalizing package '{manifest.name}'...")
         self.logger.info(f"{action} season package '{manifest.name}' ({manifest.id} v{manifest.version}).")
         return {
             "ok": True,
@@ -239,7 +261,18 @@ class PackageImporter:
         source_path: str,
         allow_update: bool = False,
         season_year: int | None = None,
+        progress_cb=None,
     ) -> dict:
+        last_progress = -1
+
+        def report(percent: int, message: str):
+            nonlocal last_progress
+            if progress_cb:
+                bounded_percent = max(0, min(percent, 100))
+                if bounded_percent != last_progress or bounded_percent in (0, 100):
+                    progress_cb(bounded_percent, message)
+                    last_progress = bounded_percent
+
         cleaned = self._clean_path_str(source_path)
         if not cleaned:
             return {"ok": False, "errors": ["Please enter or select a .zip or folder path."]}
@@ -250,17 +283,20 @@ class PackageImporter:
 
         temp_dir: Path | None = None
         try:
+            report(2, "Inspecting source package...")
             if src.is_file() and src.suffix.lower() == ".zip":
                 temp_dir = Path(tempfile.mkdtemp(prefix="f1classic_import_"))
                 with zipfile.ZipFile(src, "r") as zf:
-                    self._safe_extract(zf, temp_dir)
+                    self._safe_extract(zf, temp_dir, report, 5, 45)
+                report(55, "Locating and validating package manifests...")
                 pkg_roots = self._find_manifest_roots(temp_dir)
                 if not pkg_roots:
-                    return self._import_raw_mod(temp_dir, season_year, allow_update, src.stem)
+                    return self._import_raw_mod(temp_dir, season_year, allow_update, src.stem, report)
             elif src.is_dir():
+                report(20, "Scanning selected folder for package manifests...")
                 pkg_roots = self._find_manifest_roots(src)
                 if not pkg_roots:
-                    return self._import_raw_mod(src, season_year, allow_update)
+                    return self._import_raw_mod(src, season_year, allow_update, progress_cb=report)
             else:
                 return {
                     "ok": False,
@@ -272,6 +308,7 @@ class PackageImporter:
                     pkg_roots[0],
                     allow_update=allow_update,
                     default_season=season_year,
+                    progress_cb=report,
                 )
 
             # Multi-season pack (e.g. a folder or zip containing both 2010 and 2012)
@@ -283,6 +320,7 @@ class PackageImporter:
                         root,
                         allow_update=allow_update,
                         default_season=season_year,
+                        progress_cb=report,
                     )
                     if res.get("ok"):
                         imported.append(res["name"])
@@ -302,12 +340,12 @@ class PackageImporter:
             return {"ok": False, "errors": errors or ["No valid season manifests found."]}
 
         except ManifestValidationError as exc:
-            self.logger.error(f"Package validation failed for {src.name}: {exc}")
+            self.logger.warning(f"Package validation failed for {src.name}: {exc}")
             return {"ok": False, "errors": exc.errors}
         except zipfile.BadZipFile:
             return {"ok": False, "errors": ["Corrupted or invalid ZIP archive."]}
         except Exception as exc:
-            self.logger.error(f"Unexpected import error: {exc}")
+            self.logger.exception(f"Unexpected import error for '{src}': {exc}")
             return {"ok": False, "errors": [str(exc)]}
         finally:
             if temp_dir and temp_dir.exists():

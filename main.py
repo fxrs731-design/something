@@ -19,8 +19,10 @@ for p in (str(BASE_DIR), str(RESOURCE_DIR)):
 from core.backup_manager import BackupManager
 from core.config_manager import ConfigManager
 from core.game_detector import GameDetector
+from core.game_process_monitor import GameProcessMonitor
 from core.logger import LauncherLogger
 from core.mod_installer import ModInstaller
+from core.mod_library import ModLibraryManager
 from core.package_importer import PackageImporter
 from core.season_manager import SeasonManager
 from core.swofty_bridge import SwoftyBridge
@@ -79,16 +81,19 @@ def create_app_context(base_dir: Path | None = None) -> dict:
     game_detector = GameDetector(config, logger, swofty_bridge, backup_manager)
     package_importer = PackageImporter(config, season_manager, logger)
     mod_installer = ModInstaller(config, season_manager, game_detector, swofty_bridge, backup_manager, logger)
+    mod_library = ModLibraryManager(root / "mod-library", logger)
     return {
         "base_dir": root,
         "resource_dir": RESOURCE_DIR,
         "config": config,
         "logger": logger,
         "game_detector": game_detector,
+        "game_process_monitor": GameProcessMonitor(),
         "backup_manager": backup_manager,
         "season_manager": season_manager,
         "package_importer": package_importer,
         "mod_installer": mod_installer,
+        "mod_library": mod_library,
         "swofty_bridge": swofty_bridge,
     }
 
@@ -96,9 +101,19 @@ def create_app_context(base_dir: Path | None = None) -> dict:
 def main() -> int:
     from ui.desktop_app import launch_desktop_app
 
-    ctx = create_app_context()
+    try:
+        ctx = create_app_context()
+    except Exception as exc:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        app = QApplication.instance() or QApplication(sys.argv)
+        QMessageBox.critical(
+            None,
+            "F1 Classic Launcher Startup Failed",
+            f"The launcher could not load its settings or user data:\n\n{exc}",
+        )
+        return 1
     ctx["logger"].info("Starting F1 Classic Launcher (Native Qt Desktop)...")
-    ctx["game_detector"].detect_installed_games()
     return launch_desktop_app(ctx)
 
 

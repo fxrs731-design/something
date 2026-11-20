@@ -1,5 +1,6 @@
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ if str(ROOT_DIR) not in sys.path:
 from core.conflict_detector import ConflictDetector
 from core.logger import LauncherLogger
 from core.manifest_parser import SeasonManifest
+from core.process_utils import hidden_subprocess_options
 from core.season_manager import SeasonEntry
 from core.swofty_bridge import SwoftyBridge
 
@@ -46,6 +48,116 @@ class TestSwoftyBridgeAndConflicts(unittest.TestCase):
             mocked.assert_called_once()
             self.assertEqual(mocked.call_args[0][0], [str(cli_bin), "--version"])
 
+    def test_swofty_cli_subprocess_uses_hidden_windows_options(self):
+        bridge = SwoftyBridge(self.tmp, self.logger)
+        cli = self.tmp / "swofty_core" / "swofty.exe"
+        cli.parent.mkdir()
+        cli.write_text("MOCK_CLI", encoding="utf-8")
+        mock_proc = MagicMock(returncode=0, stdout="ok", stderr="")
+        with (
+            patch("core.swofty_bridge.hidden_subprocess_options", return_value={"creationflags": 123}),
+            patch("core.swofty_bridge.subprocess.run", return_value=mock_proc) as mocked,
+        ):
+            result = bridge.run_cli(["setup", "status"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(mocked.call_args.kwargs["creationflags"], 123)
+        self.assertEqual(mocked.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_simplified_mod_list_parser_handles_profile_state_and_converted_addons(self):
+        bridge = SwoftyBridge(self.tmp, self.logger)
+        mods_output = (
+            " 1. [on ] not converted: needs another file mod.raw-car  Raw Car Pack\n"
+            " 2. -> converted.car-pack  mod.converted-car  Converted Car Pack\n"
+            " 3. [off] mod.raw-track  Raw Track Pack\n"
+        )
+        addons_output = (
+            "converted.car-pack               1.0.0      enabled   Converted Car Pack\n"
+            "other.addon                      2.0.0      disabled  Other Addon\n"
+        )
+        with patch.object(
+            bridge,
+            "run_cli",
+            side_effect=[
+                {"ok": True, "stdout": mods_output},
+                {"ok": True, "stdout": addons_output},
+            ],
+        ):
+            result = bridge.list_simplified_mods("f1classic_2010")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["mods"],
+            [
+                {
+                    "position": 1,
+                    "id": "mod.raw-car",
+                    "name": "Raw Car Pack",
+                    "enabled": True,
+                    "addon_id": None,
+                    "state": "[on ]",
+                },
+                {
+                    "position": 2,
+                    "id": "mod.converted-car",
+                    "name": "Converted Car Pack",
+                    "enabled": True,
+                    "addon_id": "converted.car-pack",
+                    "state": "-> converted.car-pack",
+                },
+                {
+                    "position": 3,
+                    "id": "mod.raw-track",
+                    "name": "Raw Track Pack",
+                    "enabled": False,
+                    "addon_id": None,
+                    "state": "[off]",
+                },
+            ],
+        )
+
+    def test_swofty_addon_package_is_enabled_only_in_requested_profile(self):
+        bridge = SwoftyBridge(self.tmp, self.logger)
+        package = self.tmp / "sample.swoftyaddon"
+        package.write_bytes(b"mock package")
+        with patch.object(
+            bridge,
+            "run_cli",
+            side_effect=[
+                {"ok": True, "stdout": "installed sample.carpack 1.0.0\n"},
+                {"ok": True, "stdout": "enabled sample.carpack in profile f1classic_2012\n"},
+            ],
+        ) as run_cli:
+            result = bridge.install_addon_from_path(package, "f1classic_2012")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["addon_ids"], ["sample.carpack"])
+        self.assertEqual(
+            run_cli.call_args_list[0].args[0],
+            ["addons", "install", str(package.resolve())],
+        )
+        self.assertEqual(
+            run_cli.call_args_list[1].args[0],
+            ["--profile", "f1classic_2012", "addons", "enable", "sample.carpack"],
+        )
+
+    def test_hidden_subprocess_options_configure_no_console_on_windows(self):
+        from types import SimpleNamespace
+
+        startupinfo = SimpleNamespace(dwFlags=0, wShowWindow=0)
+        with (
+            patch("core.process_utils.os.name", "nt"),
+            patch.object(subprocess, "STARTUPINFO", return_value=startupinfo, create=True),
+            patch.object(subprocess, "STARTF_USESHOWWINDOW", 1, create=True),
+            patch.object(subprocess, "SW_HIDE", 0, create=True),
+            patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True),
+        ):
+            options = hidden_subprocess_options()
+
+        self.assertEqual(options["creationflags"], 0x08000000)
+        self.assertIs(options["startupinfo"], startupinfo)
+        self.assertEqual(startupinfo.dwFlags, 1)
+
     def test_reorder_rolls_back_to_empty_profile_after_enable_failure(self):
         bridge = SwoftyBridge(self.tmp, self.logger)
         calls = []
@@ -66,7 +178,7 @@ class TestSwoftyBridgeAndConflicts(unittest.TestCase):
             ("new.addon", False),
         ])
 
-    def test_launch_uses_swofty_apply_for_modded_and_vanilla_cli_for_normal(self):
+    def test_launch_blocks_modded_path_and_uses_official_ea_launch_for_vanilla(self):
         bridge = SwoftyBridge(self.tmp, self.logger, self.tmp / "swofty_data")
         core_dir = self.tmp / "swofty_core"
         cli = core_dir / "swofty.exe"
@@ -78,23 +190,20 @@ class TestSwoftyBridgeAndConflicts(unittest.TestCase):
         game_dir = self.tmp / "F1 25"
         game_dir.mkdir()
         bridge.register_game = MagicMock(return_value={"ok": True})
-        bridge.setup_status = MagicMock(return_value={"ok": True, "done": True})
-        bridge.ensure_watermark_addon = MagicMock(return_value={"ok": True})
-        bridge.check_conflicts = MagicMock(return_value={"ok": True, "stdout": "clean"})
-
-        with patch("core.swofty_bridge.subprocess.Popen", return_value=MagicMock(pid=17)) as popen:
+        with patch.object(bridge, "run_cli", return_value={"ok": True, "stdout": "EA launch accepted"}) as run_cli:
             modded = bridge.launch_game(game_dir, modded=True)
-            self.assertTrue(modded["ok"])
-            self.assertEqual(popen.call_args.args[0], [
-                str(cli), "--profile", "default", "run", "--apply", "--game", str(game_dir.resolve())
-            ])
+            self.assertFalse(modded["ok"])
+            self.assertIn("without EA AntiCheat", modded["error"])
 
-            bridge.launch_game(game_dir, modded=False)
-            self.assertEqual(popen.call_args.args[0], [
-                str(cli), "game", "launch", "--game", str(game_dir.resolve())
+            launched = bridge.launch_game(game_dir, modded=False)
+            self.assertTrue(launched["ok"])
+            self.assertEqual(run_cli.call_args.args[0], [
+                "game", "launch", "--game", str(game_dir.resolve())
             ])
+            self.assertEqual(run_cli.call_args.kwargs["timeout_seconds"], 360)
+            self.assertIn("EA AntiCheat", launched["profile"])
 
-    def test_modded_launch_is_blocked_until_swofty_setup_is_done(self):
+    def test_modded_launch_is_blocked_without_invoking_swofty(self):
         bridge = SwoftyBridge(self.tmp, self.logger)
         core_dir = self.tmp / "swofty_core"
         cli = core_dir / "swofty.exe"
@@ -106,18 +215,14 @@ class TestSwoftyBridgeAndConflicts(unittest.TestCase):
         game_dir = self.tmp / "F1 25"
         game_dir.mkdir()
         bridge.register_game = MagicMock(return_value={"ok": True})
-        bridge.setup_status = MagicMock(return_value={
-            "ok": True,
-            "done": False,
-            "output": "setup: not done",
-        })
 
-        with patch("core.swofty_bridge.subprocess.Popen") as popen:
+        with patch.object(bridge, "run_cli") as run_cli:
             result = bridge.launch_game(game_dir, modded=True)
 
         self.assertFalse(result["ok"])
-        self.assertTrue(result["setup_required"])
-        popen.assert_not_called()
+        self.assertIn("without EA AntiCheat", result["error"])
+        bridge.register_game.assert_not_called()
+        run_cli.assert_not_called()
 
     def test_setup_reset_passes_game_folder_and_other_mods_choice(self):
         bridge = SwoftyBridge(self.tmp, self.logger)

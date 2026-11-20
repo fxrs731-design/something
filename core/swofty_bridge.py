@@ -10,6 +10,7 @@ import urllib.request
 from pathlib import Path
 
 from core.logger import LauncherLogger
+from core.process_utils import hidden_subprocess_options
 
 
 SIMPLIFIED_IMPORTER_REPO = "TeamSimplified/simplified-swofty-addon"
@@ -147,6 +148,7 @@ class SwoftyBridge:
         if env_overrides:
             env.update(env_overrides)
         try:
+            self.logger.info(f"Starting Swofty CLI subprocess: {cli.name} {' '.join(args)}")
             proc = subprocess.run(
                 cmd,
                 cwd=str(cwd or (self.core_dir if self.core_dir.is_dir() else self.base_dir)),
@@ -154,6 +156,8 @@ class SwoftyBridge:
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                stdin=subprocess.DEVNULL,
+                **hidden_subprocess_options(),
             )
             result = {
                 "ok": proc.returncode == 0,
@@ -161,6 +165,7 @@ class SwoftyBridge:
                 "stdout": proc.stdout,
                 "stderr": proc.stderr,
             }
+            self.logger.info(f"Swofty CLI subprocess exited with code {proc.returncode}.")
             if proc.returncode != 0:
                 self.logger.error(
                     f"Swofty CLI failed ({proc.returncode}): {(proc.stderr or proc.stdout).strip()}"
@@ -378,6 +383,123 @@ class SwoftyBridge:
         self.logger.info(f"Simplified Importer created Swofty addon(s): {', '.join(imported_ids)}")
         return {"ok": True, "addon_ids": imported_ids, "stdout": result.get("stdout", "")}
 
+    def install_addon_from_path(self, source: Path, profile: str) -> dict:
+        result = self.run_cli(
+            ["addons", "install", str(Path(source).resolve())],
+            timeout_seconds=600,
+        )
+        if not result["ok"]:
+            return result
+        addon_ids = list(dict.fromkeys(re.findall(
+            r"(?m)^installed\s+([A-Za-z0-9._-]+)(?:\s+|$)",
+            result.get("stdout", ""),
+        )))
+        if not addon_ids:
+            return {
+                "ok": False,
+                "error": "Swofty installed the package but did not report its addon ID.",
+                "stdout": result.get("stdout", ""),
+            }
+        for addon_id in addon_ids:
+            enabled = self.set_addon_enabled(addon_id, True, profile)
+            if not enabled["ok"]:
+                return {
+                    **enabled,
+                    "addon_ids": addon_ids,
+                    "error": enabled.get("error") or enabled.get("stderr") or f"Installed {addon_id}, but could not enable it in profile {profile}.",
+                }
+        return {"ok": True, "addon_ids": addon_ids, "stdout": result.get("stdout", "")}
+
+    def list_profile_addons(self, profile: str) -> dict:
+        result = self.run_cli(["--profile", profile, "addons", "list"])
+        if not result["ok"]:
+            return result
+        addons = {}
+        for line in (result.get("stdout") or "").splitlines():
+            parts = line.split(maxsplit=3)
+            if len(parts) < 3 or parts[2] not in ("enabled", "disabled"):
+                continue
+            addons[parts[0]] = {
+                "id": parts[0],
+                "enabled": parts[2] == "enabled",
+                "name": parts[3] if len(parts) > 3 else parts[0],
+            }
+        return {"ok": True, "addons": addons}
+
+    def list_simplified_mods(self, profile: str) -> dict:
+        result = self.run_cli(["--profile", profile, "mods", "list"])
+        if not result["ok"]:
+            return result
+        addons_result = self.list_profile_addons(profile)
+        if not addons_result["ok"]:
+            return addons_result
+        addons = addons_result["addons"]
+        mods = []
+        for line in (result.get("stdout") or "").splitlines():
+            row = re.match(r"^\s*(\d+)\.\s+(.*)$", line)
+            if not row:
+                continue
+            position, remainder = row.groups()
+            addon_id = None
+            enabled = None
+            if remainder.startswith("-> "):
+                converted = re.match(r"^->\s+(\S+)\s+(.+)$", remainder)
+                if not converted:
+                    continue
+                addon_id, remainder = converted.groups()
+                enabled = addons.get(addon_id, {}).get("enabled")
+                state = f"-> {addon_id}"
+            elif remainder.startswith("["):
+                end = remainder.find("]")
+                if end < 0:
+                    continue
+                state = remainder[:end + 1]
+                enabled = state.startswith("[on")
+                remainder = remainder[end + 1:].strip()
+                if remainder.startswith("not converted:"):
+                    boundary = re.search(r"\s(\S+)\s{2}(.+)$", remainder)
+                    if not boundary:
+                        continue
+                    remainder = f"{boundary.group(1)}  {boundary.group(2)}"
+            elif remainder.startswith("addon "):
+                state = "addon"
+                remainder = remainder[len("addon "):]
+            else:
+                continue
+            package = re.match(r"^(\S+)\s{2}(.+)$", remainder)
+            if not package:
+                continue
+            mod_id, name = package.groups()
+            mods.append({
+                "position": int(position),
+                "id": mod_id,
+                "name": name,
+                "enabled": enabled,
+                "addon_id": addon_id,
+                "state": state,
+            })
+        return {"ok": True, "mods": mods, "addons": addons, "stdout": result.get("stdout", "")}
+
+    def set_simplified_mod_enabled(self, mod_id: str, enabled: bool, profile: str) -> dict:
+        action = "enable" if enabled else "disable"
+        result = self.run_cli(["--profile", profile, "mods", action, mod_id])
+        if not result["ok"]:
+            return result
+        listed = self.list_simplified_mods(profile)
+        if not listed["ok"]:
+            return listed
+        mod = next((entry for entry in listed["mods"] if entry["id"] == mod_id), None)
+        if mod and mod.get("addon_id"):
+            addon = self.set_addon_enabled(mod["addon_id"], enabled, profile)
+            if not addon["ok"]:
+                return addon
+        return result
+
+    def move_simplified_mod(self, mod_id: str, position: int, profile: str) -> dict:
+        if position < 1:
+            return {"ok": False, "error": "Load-order positions start at 1."}
+        return self.run_cli(["--profile", profile, "mods", "move", mod_id, str(position)])
+
     def set_addon_enabled(self, addon_id: str, enabled: bool, profile: str = "default") -> dict:
         action = "enable" if enabled else "disable"
         args = ["--profile", profile, "addons", action, addon_id]
@@ -437,63 +559,34 @@ class SwoftyBridge:
 
     def launch_game(self, game_dir: Path, modded: bool) -> dict:
         game_dir = Path(game_dir).resolve()
+        if modded:
+            return {
+                "ok": False,
+                "error": (
+                    "Modded F1 25 launch is unavailable: the pinned Swofty `run --apply` command runs "
+                    "without EA AntiCheat. No anti-cheat bypass or direct game-executable launch was attempted."
+                ),
+            }
         registered = self.register_game(game_dir)
         if not registered["ok"]:
-            return {"ok": False, "error": f"Could not register the F1 25 game folder with Swofty: {registered.get('stderr') or registered.get('error')}"}
+            error = registered.get("stderr") or registered.get("error")
+            return {"ok": False, "error": f"Could not register the F1 25 game folder with Swofty: {error}"}
 
-        if modded:
-            setup = self.setup_status()
-            if not setup["ok"]:
-                return setup
-            if not setup["done"]:
-                return {
-                    "ok": False,
-                    "setup_required": True,
-                    "error": (
-                        "Swofty one-time setup is incomplete. Open Settings & Games, run the setup reset, "
-                        "follow Swofty's game verification or repair instruction (if any), then finish setup "
-                        "before modded play."
-                    ),
-                    "stdout": setup.get("output", ""),
-                }
-            status = self.get_status()
-            if not any(Path(name).name.lower() == "swofty_core.dll" for name in status["native_dlls"]):
-                return {"ok": False, "error": "Swofty Core's native loader DLLs are missing; modded launch is unavailable."}
-            enabled = self.ensure_watermark_addon("default")
-            if not enabled["ok"]:
-                return enabled
-            preflight = self.check_conflicts(game_dir)
-            if not preflight["ok"]:
-                return {
-                    "ok": False,
-                    "error": f"Swofty could not build the enabled F1 25 mods: {preflight.get('stderr') or preflight.get('error')}",
-                    "stdout": preflight.get("stdout", ""),
-                }
-            args = ["--profile", "default", "run", "--apply", "--game", str(game_dir)]
-            self.logger.info(f"Swofty modded F1 25 profile build succeeded: {(preflight.get('stdout') or '').strip()}")
-        else:
-            args = ["game", "launch", "--game", str(game_dir)]
-
-        cli = self.find_swofty_cli()
-        if not cli:
-            return {"ok": False, "error": self.get_status()["message"]}
-        env = os.environ.copy()
-        env["SWOFTY_DATA_DIR"] = str(self.data_dir)
-        native_dir = self.get_native_dist_dir()
-        if native_dir:
-            env["SWOFTY_NATIVE_DIST"] = str(native_dir)
-
-        try:
-            flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if modded and sys.platform.startswith("win") else 0
-            proc = subprocess.Popen(
-                [str(cli), *args],
-                cwd=str(self.core_dir if self.core_dir.is_dir() else self.base_dir),
-                env=env,
-                creationflags=flags,
-            )
-            profile = "default (modded)" if modded else "vanilla (no Swofty mods)"
-            self.logger.info(f"Started Swofty {profile} F1 25 session (PID {proc.pid}).")
-            return {"ok": True, "pid": proc.pid, "profile": profile, "cli_path": str(cli)}
-        except OSError as exc:
-            self.logger.error(f"Failed to start the Swofty F1 25 session: {exc}")
-            return {"ok": False, "error": str(exc)}
+        result = self.run_cli(
+            ["game", "launch", "--game", str(game_dir)],
+            timeout_seconds=360,
+        )
+        if not result["ok"]:
+            return {
+                **result,
+                "error": result.get("stderr") or result.get("error") or "Swofty could not start F1 25 through the EA app.",
+            }
+        self.logger.info(
+            "Swofty confirmed F1 25 started through its official EA app path (EA AntiCheat enabled)."
+        )
+        return {
+            "ok": True,
+            "profile": "official EA app launch (EA AntiCheat)",
+            "cli_path": str(self.find_swofty_cli()),
+            "stdout": result.get("stdout", ""),
+        }

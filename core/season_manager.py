@@ -1,4 +1,5 @@
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,8 +70,12 @@ class SeasonManager:
 
         return entries
 
-    def get_season(self, season_id: str) -> SeasonEntry | None:
-        for entry in self.scan_seasons():
+    def get_season(
+        self,
+        season_id: str,
+        entries: Iterable[SeasonEntry] | None = None,
+    ) -> SeasonEntry | None:
+        for entry in entries if entries is not None else self.scan_seasons():
             if entry.manifest.id == season_id:
                 return entry
         return None
@@ -81,8 +86,9 @@ class SeasonManager:
         year: int | None = None,
         game: str = "",
         sort_by: str = "season_desc",
+        entries: Iterable[SeasonEntry] | None = None,
     ) -> list[SeasonEntry]:
-        entries = self.scan_seasons()
+        entries = list(entries) if entries is not None else self.scan_seasons()
         q = search.strip().lower()
         if q:
             entries = [
@@ -117,6 +123,10 @@ class SeasonManager:
                 "ok": False,
                 "error": f"Season '{entry.manifest.name}' is currently installed in {entry.manifest.game}. Uninstall it first.",
             }
-        shutil.rmtree(entry.package_dir, ignore_errors=True)
+        try:
+            shutil.rmtree(entry.package_dir)
+        except OSError as exc:
+            self.logger.exception(f"Could not remove season package '{season_id}': {exc}")
+            return {"ok": False, "error": f"Could not remove package '{season_id}': {exc}"}
         self.logger.info(f"Removed season package '{season_id}'.")
         return {"ok": True}

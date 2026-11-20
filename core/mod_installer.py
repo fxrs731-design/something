@@ -1,4 +1,5 @@
 import hashlib
+import json
 import shutil
 import tempfile
 import zipfile
@@ -15,6 +16,7 @@ from core.swofty_bridge import SwoftyBridge, WATERMARK_ADDON_ID
 
 class ModInstaller:
     PROFILE = "default"
+    SEASON_PROFILES = {2010: "f1classic_2010", 2012: "f1classic_2012"}
 
     def __init__(
         self,
@@ -31,6 +33,221 @@ class ModInstaller:
         self.swofty_bridge = swofty_bridge
         self.backup_manager = backup_manager
         self.logger = logger
+
+    @classmethod
+    def profile_for_season(cls, season_year: int) -> str:
+        try:
+            return cls.SEASON_PROFILES[season_year]
+        except KeyError as exc:
+            raise ValueError("Only the 2010 and 2012 F1 25 mod profiles are supported.") from exc
+
+    @staticmethod
+    def _is_swofty_addon_source(source: Path) -> bool:
+        if source.is_dir():
+            return (source / "swofty.json").is_file()
+        if source.suffix.lower() == ".swoftyaddon":
+            return True
+        if source.suffix.lower() != ".zip":
+            return False
+        try:
+            with zipfile.ZipFile(source) as archive:
+                for member in archive.infolist():
+                    normalized = member.filename.replace("\\", "/").strip("/")
+                    parts = normalized.split("/")
+                    if (
+                        not parts
+                        or parts[-1].casefold() != "swofty.json"
+                        or len(parts) > 4
+                        or member.file_size > 1024 * 1024
+                    ):
+                        continue
+                    try:
+                        manifest = json.loads(archive.read(member).decode("utf-8-sig"))
+                    except (zipfile.BadZipFile, EOFError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(manifest, dict) and all(
+                        isinstance(manifest.get(key), str) and manifest[key]
+                        for key in ("id", "name", "version")
+                    ):
+                        return True
+        except (OSError, zipfile.BadZipFile):
+            return False
+        return False
+
+    def get_swofty_mod_profile(self, season_year: int) -> dict:
+        profile = self.profile_for_season(season_year)
+        enabled = self.swofty_bridge.ensure_simplified_importer(profile)
+        if not enabled["ok"]:
+            return {
+                **enabled,
+                "error": enabled.get("error") or enabled.get("stderr") or enabled.get("stdout") or "Could not prepare the Simplified Importer for this Swofty profile.",
+            }
+        state = self.swofty_bridge.list_simplified_mods(profile)
+        if not state["ok"]:
+            return {
+                **state,
+                "error": state.get("error") or state.get("stderr") or state.get("stdout") or "Could not read this Swofty profile.",
+            }
+        overrides_by_profile = self.config.data.get("swofty_mod_enabled_overrides", {})
+        overrides = overrides_by_profile.get(profile, {}) if isinstance(overrides_by_profile, dict) else {}
+        if not isinstance(overrides, dict):
+            overrides = {}
+        for mod in state["mods"]:
+            mod["state_unknown"] = mod.get("enabled") is None
+            if mod["state_unknown"] and isinstance(overrides.get(mod["id"]), bool):
+                mod["enabled"] = overrides[mod["id"]]
+        direct_by_profile = self.config.data.get("swofty_direct_addons", {})
+        direct_ids = direct_by_profile.get(profile, []) if isinstance(direct_by_profile, dict) else []
+        if not isinstance(direct_ids, list):
+            direct_ids = []
+        direct_addons = [
+            state["addons"][addon_id]
+            for addon_id in direct_ids
+            if addon_id in state["addons"]
+        ]
+        return {
+            "ok": True,
+            "profile": profile,
+            "mods": state["mods"],
+            "direct_addons": direct_addons,
+        }
+
+    def import_swofty_mod(
+        self,
+        source_path: str | Path,
+        season_year: int,
+        progress_cb: Callable[[int, str], None] | None = None,
+    ) -> dict:
+        try:
+            profile = self.profile_for_season(season_year)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        source = Path(source_path).expanduser()
+        if not source.exists():
+            return {"ok": False, "error": f"Selected mod package does not exist: {source}"}
+        source = source.resolve()
+        if source.is_file() and source.suffix.casefold() in (".erp", ".serps"):
+            return {
+                "ok": False,
+                "error": (
+                    "A standalone .erp file has no game-folder destination, and .serps is package metadata, "
+                    "not a mod by itself. Import the original mod folder or its ZIP, 7z, or RAR archive."
+                ),
+            }
+
+        if progress_cb:
+            progress_cb(5, "Validating the package for the selected Swofty profile...")
+        if self._is_swofty_addon_source(source):
+            result = self.swofty_bridge.install_addon_from_path(source, profile)
+            addon_ids = result.get("addon_ids") or ([result["addon_id"]] if result.get("addon_id") else [])
+            if not result["ok"]:
+                return {
+                    **result,
+                    "error": result.get("error") or result.get("stderr") or result.get("stdout") or "Swofty could not install this addon package.",
+                }
+            direct_by_profile = self.config.data.get("swofty_direct_addons")
+            if not isinstance(direct_by_profile, dict):
+                direct_by_profile = {}
+                self.config.data["swofty_direct_addons"] = direct_by_profile
+            saved_ids = direct_by_profile.get(profile)
+            if not isinstance(saved_ids, list):
+                saved_ids = []
+                direct_by_profile[profile] = saved_ids
+            for addon_id in addon_ids:
+                if addon_id not in saved_ids:
+                    saved_ids.append(addon_id)
+            self.config.data["selected_swofty_profile_year"] = season_year
+            self.config.save()
+            return {
+                "ok": True,
+                "kind": "addon",
+                "profile": profile,
+                "addon_ids": addon_ids,
+                "name": source.stem,
+                "stdout": result.get("stdout", ""),
+            }
+
+        game_dir_str = self.config.get_game_path("F1 25")
+        game_check = self.game_detector.validate_game_directory("F1 25", game_dir_str)
+        if not game_check["valid"]:
+            return {
+                "ok": False,
+                "error": f"Configure a valid F1 25 game folder before importing mods: {game_check['reason']}",
+            }
+        if progress_cb:
+            progress_cb(15, "Simplified Importer is validating and converting the mod...")
+        imported = self.swofty_bridge.import_mods(source, Path(game_check["directory"]), profile)
+        if not imported["ok"]:
+            return {
+                **imported,
+                "error": imported.get("error") or imported.get("stderr") or "Simplified Importer rejected the mod package.",
+            }
+        if progress_cb:
+            progress_cb(95, "Saving the selected F1 25 profile...")
+        self.config.data["selected_swofty_profile_year"] = season_year
+        self.config.save()
+        self.logger.info(
+            f"Imported F1 25 mod source '{source.name}' into Swofty profile {profile}; "
+            f"addon IDs: {', '.join(imported.get('addon_ids', [])) or 'none reported'}."
+        )
+        return {
+            "ok": True,
+            "kind": "mod",
+            "profile": profile,
+            "addon_ids": imported.get("addon_ids", []),
+            "name": source.name,
+            "stdout": imported.get("stdout", ""),
+        }
+
+    def set_swofty_mod_enabled(
+        self,
+        season_year: int,
+        mod_id: str,
+        enabled: bool,
+        remember_unknown: bool = False,
+    ) -> dict:
+        try:
+            profile = self.profile_for_season(season_year)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        result = self.swofty_bridge.set_simplified_mod_enabled(mod_id, enabled, profile)
+        if result["ok"] and remember_unknown:
+            overrides = self.config.data.get("swofty_mod_enabled_overrides")
+            if not isinstance(overrides, dict):
+                overrides = {}
+                self.config.data["swofty_mod_enabled_overrides"] = overrides
+            profile_overrides = overrides.get(profile)
+            if not isinstance(profile_overrides, dict):
+                profile_overrides = {}
+                overrides[profile] = profile_overrides
+            profile_overrides[mod_id] = bool(enabled)
+            self.config.save()
+        return result
+
+    def set_swofty_addon_enabled(self, season_year: int, addon_id: str, enabled: bool) -> dict:
+        try:
+            profile = self.profile_for_season(season_year)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return self.swofty_bridge.set_addon_enabled(addon_id, enabled, profile)
+
+    def move_swofty_mod(self, season_year: int, mod_id: str, position: int) -> dict:
+        try:
+            profile = self.profile_for_season(season_year)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return self.swofty_bridge.move_simplified_mod(mod_id, position, profile)
+
+    def check_swofty_profile_conflicts(self, season_year: int) -> dict:
+        try:
+            profile = self.profile_for_season(season_year)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        game_dir_str = self.config.get_game_path("F1 25")
+        game_check = self.game_detector.validate_game_directory("F1 25", game_dir_str)
+        if not game_check["valid"]:
+            return {"ok": False, "error": f"Configure a valid F1 25 game folder first: {game_check['reason']}"}
+        return self.swofty_bridge.check_conflicts(Path(game_check["directory"]), profile)
 
     @staticmethod
     def _safe_relative_path(raw_path: str) -> Path:
@@ -194,10 +411,15 @@ class ModInstaller:
         self._season_addon_fingerprints()[entry.manifest.id] = fingerprint
         return addon_ids
 
-    def _year_addons(self, season_year: int) -> list[str]:
+    def _year_addons(
+        self,
+        season_year: int,
+        entries: list[SeasonEntry] | None = None,
+    ) -> list[str]:
         mapping = self._season_addons()
         discovered: list[str] = []
-        for entry in sorted(self.season_manager.scan_seasons(), key=lambda item: (item.imported_at, item.manifest.id)):
+        season_entries = entries if entries is not None else self.season_manager.scan_seasons()
+        for entry in sorted(season_entries, key=lambda item: (item.imported_at, item.manifest.id)):
             if entry.manifest.game.lower() != "f1 25" or entry.manifest.season != season_year:
                 continue
             for addon_id in mapping.get(entry.manifest.id, []):
@@ -220,7 +442,8 @@ class ModInstaller:
             if progress_cb:
                 progress_cb(pct, message)
 
-        entry = self.season_manager.get_season(season_id)
+        all_entries = self.season_manager.scan_seasons()
+        entry = self.season_manager.get_season(season_id, all_entries)
         if not entry:
             return {"ok": False, "error": f"Season '{season_id}' not found."}
         if entry.manifest.game.lower() != "f1 25":
@@ -241,7 +464,7 @@ class ModInstaller:
                 ),
             }
 
-        available_ids = {season.manifest.id for season in self.season_manager.scan_seasons()}
+        available_ids = {season.manifest.id for season in all_entries}
         missing_deps = [
             dependency
             for dependency in entry.manifest.dependencies
@@ -252,12 +475,12 @@ class ModInstaller:
 
         entries = [
             season
-            for season in self.season_manager.scan_seasons()
+            for season in all_entries
             if season.manifest.game.lower() == "f1 25" and season.manifest.season == entry.manifest.season
         ]
         old_active_id = self.config.get_active_season("F1 25")
-        old_entry = self.season_manager.get_season(old_active_id) if old_active_id else None
-        old_addon_ids = self._year_addons(old_entry.manifest.season) if old_entry else []
+        old_entry = self.season_manager.get_season(old_active_id, all_entries) if old_active_id else None
+        old_addon_ids = self._year_addons(old_entry.manifest.season, all_entries) if old_entry else []
         imported_this_run: list[str] = []
         resolved: dict[str, list[str]] = {}
 
@@ -274,7 +497,7 @@ class ModInstaller:
             if resolved:
                 self._season_addons().update(resolved)
                 self.config.save()
-            self.logger.error(f"Swofty conversion failed for season '{season_id}': {exc}")
+            self.logger.exception(f"Swofty conversion failed for season '{season_id}': {exc}")
             return {"ok": False, "error": str(exc)}
 
         self._season_addons().update(resolved)
@@ -357,14 +580,15 @@ class ModInstaller:
         }
 
     def reorder_season_addons(self, season_id: str, addon_ids: list[str]) -> dict:
-        entry = self.season_manager.get_season(season_id)
+        entries = self.season_manager.scan_seasons()
+        entry = self.season_manager.get_season(season_id, entries)
         if not entry or entry.manifest.game.lower() != "f1 25":
             return {"ok": False, "error": "Select an imported F1 25 season first."}
-        previous = self._year_addons(entry.manifest.season)
+        previous = self._year_addons(entry.manifest.season, entries)
         if len(addon_ids) != len(set(addon_ids)) or set(addon_ids) != set(previous):
             return {"ok": False, "error": "The requested load order must contain each addon for this season exactly once."}
         active_id = self.config.get_active_season("F1 25")
-        active_entry = self.season_manager.get_season(active_id) if active_id else None
+        active_entry = self.season_manager.get_season(active_id, entries) if active_id else None
         if not active_entry or active_entry.manifest.season != entry.manifest.season:
             return {"ok": False, "error": "Activate this season before changing its Swofty load order."}
 
@@ -386,14 +610,15 @@ class ModInstaller:
         return {"ok": True, "conflicts": (conflicts.get("stdout") or "").strip()}
 
     def uninstall_season(self, season_id: str) -> dict:
-        entry: SeasonEntry | None = self.season_manager.get_season(season_id)
+        entries = self.season_manager.scan_seasons()
+        entry: SeasonEntry | None = self.season_manager.get_season(season_id, entries)
         if not entry:
             return {"ok": False, "error": f"Season '{season_id}' not found."}
         if entry.manifest.game.lower() != "f1 25":
             return {"ok": False, "error": "Only F1 25 mods can be deactivated."}
 
         active_id = self.config.get_active_season("F1 25")
-        active_entry = self.season_manager.get_season(active_id) if active_id else None
+        active_entry = self.season_manager.get_season(active_id, entries) if active_id else None
         if not active_entry or active_entry.manifest.season != entry.manifest.season:
             return {"ok": True, "restored": 0, "disabled_addons": 0}
 
@@ -408,7 +633,7 @@ class ModInstaller:
             self.logger.info(f"Restored legacy direct-copy season {active_id} to the original F1 25 files.")
             return {"ok": True, "restored": restored.get("restored", 0), "disabled_addons": 0}
 
-        addon_ids = self._year_addons(entry.manifest.season)
+        addon_ids = self._year_addons(entry.manifest.season, entries)
         for addon_id in addon_ids:
             result = self.swofty_bridge.set_addon_enabled(addon_id, False, self.PROFILE)
             if not result["ok"]:

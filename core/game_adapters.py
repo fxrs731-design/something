@@ -36,12 +36,19 @@ class GameAdapter:
 
     @staticmethod
     def find_executable(game_name: str, game_dir: Path, preferred_exe: str = "") -> Path | None:
+        game_dir = Path(game_dir)
         if preferred_exe:
             pref_path = Path(preferred_exe)
-            if pref_path.is_file():
+            if not pref_path.is_absolute():
+                pref_path = game_dir / pref_path
+            profile = GAME_PROFILES.get(game_name)
+            if (
+                profile
+                and pref_path.is_file()
+                and pref_path.name.lower() in {name.lower() for name in profile.executables}
+                and pref_path.resolve().parent == game_dir.resolve()
+            ):
                 return pref_path
-            if game_dir.is_dir() and (game_dir / preferred_exe).is_file():
-                return game_dir / preferred_exe
 
         if not game_dir.is_dir():
             return None

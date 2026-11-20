@@ -1,8 +1,3 @@
 @echo off
-cd /d "%~dp0"
-python main.py
-if errorlevel 1 (
-    echo.
-    echo Python 3.8+ is required to run main.py. Download from https://www.python.org/downloads/
-    pause
-)
+start "" wscript.exe "%~dp0Launch_F1_Classic_Launcher.vbs"
+exit /b 0

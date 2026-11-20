@@ -13,7 +13,10 @@ class LauncherLogger:
 
         self._logger = logging.getLogger("F1ClassicLauncher")
         self._logger.setLevel(logging.DEBUG)
-        self._logger.handlers.clear()
+        self._logger.propagate = False
+        for handler in self._logger.handlers[:]:
+            handler.close()
+            self._logger.removeHandler(handler)
 
         fh = logging.FileHandler(self.log_file, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
@@ -36,6 +39,10 @@ class LauncherLogger:
 
     def error(self, message: str):
         self._logger.error(message)
+        self._record("ERROR", message)
+
+    def exception(self, message: str):
+        self._logger.exception(message)
         self._record("ERROR", message)
 
     def get_recent(self, limit: int = 200) -> list[dict]:

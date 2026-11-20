@@ -23,6 +23,7 @@ class BackupManager:
         bdir = self.get_season_backup_dir(game_name, season_id)
         files_dir = bdir / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Started backup for {game_name} season {season_id} at {bdir}.")
         return {
             "game": game_name,
             "season_id": season_id,

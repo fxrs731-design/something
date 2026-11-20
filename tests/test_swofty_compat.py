@@ -129,15 +129,35 @@ class TestSwoftyByDaniXCompat(unittest.TestCase):
         self.assertEqual(season.manifest.game, "F1 25")
         self.assertEqual(season.manifest.season, 2012)
 
-    def test_ea_service_launcher_is_not_mistaken_for_the_game_executable(self):
+    def test_ea_service_launcher_path_resolves_to_f1_25_installation(self):
         game_25 = self.tmp / "Games" / "F1 25 Custom"
         game_25.mkdir(parents=True)
+        game_exe = game_25 / "F1_25.exe"
+        game_exe.write_text("MOCK_F1_25", encoding="utf-8")
         ea_exe = game_25 / "EAAntiCheat.GameServiceLauncher.exe"
         ea_exe.write_text("MOCK_EA_ANTICHEAT_LAUNCHER", encoding="utf-8")
 
         result = self.ctx["game_detector"].validate_game_directory("F1 25", str(ea_exe))
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["directory"], str(game_25))
+        self.assertEqual(result["executable"], str(game_exe))
+
+    def test_game_path_validation_does_not_accept_executable_from_another_install(self):
+        configured = self.tmp / "Games" / "F1 25 Configured"
+        other = self.tmp / "Games" / "F1 25 Other"
+        configured.mkdir(parents=True)
+        other.mkdir(parents=True)
+        unrelated_exe = other / "F1_25.exe"
+        unrelated_exe.write_text("MOCK_F1_25", encoding="utf-8")
+
+        result = self.ctx["game_detector"].validate_game_directory(
+            "F1 25",
+            str(configured),
+            preferred_exe=str(unrelated_exe),
+        )
+
         self.assertFalse(result["valid"])
-        self.assertIn("F1_25.exe", result["reason"])
+        self.assertEqual(result["directory"], str(configured))
 
     def test_quoted_path_bom_and_multi_season_folder_import(self):
         parent = self.tmp / "F1 2010 - 2012 car mod"

@@ -2,17 +2,20 @@ import json
 import os
 import py_compile
 import sys
+import threading
+import time
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from main import _migrate_legacy_user_data, create_app_context
+from core.game_process_monitor import GameProcessMonitor
 from core.swofty_bridge import SwoftyBridge
 
 
@@ -85,6 +88,16 @@ class FakeSwoftyBridge:
         return {"available": False, "native_dlls": []}
 
 
+class FakeGameProcessMonitor:
+    def __init__(self, running=False):
+        self.running = running
+        self.calls = 0
+
+    def is_f1_25_running(self):
+        self.calls += 1
+        return self.running
+
+
 class TestF1ClassicLauncher(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="f1classic_test_"))
@@ -100,6 +113,100 @@ class TestF1ClassicLauncher(unittest.TestCase):
         (self.game_25 / "asset_groups").mkdir()
         (self.game_25 / "unrelated.txt").write_text("KEEP_ME_SAFE", encoding="utf-8")
         self.ctx["config"].set_game_path("F1 25", str(self.game_25))
+
+    def test_swofty_mod_profiles_are_separate_for_f1_25_seasons(self):
+        installer = self.ctx["mod_installer"]
+        bridge = MagicMock()
+        bridge.ensure_simplified_importer.return_value = {"ok": True}
+        bridge.list_simplified_mods.side_effect = [
+            {"ok": True, "mods": [{"id": "mod.2010", "enabled": False}], "addons": {}},
+            {"ok": True, "mods": [{"id": "mod.2012", "enabled": True}], "addons": {}},
+        ]
+        installer.swofty_bridge = bridge
+
+        profile_2010 = installer.get_swofty_mod_profile(2010)
+        profile_2012 = installer.get_swofty_mod_profile(2012)
+
+        self.assertEqual(profile_2010["profile"], "f1classic_2010")
+        self.assertEqual(profile_2012["profile"], "f1classic_2012")
+        self.assertEqual(
+            [call.args for call in bridge.ensure_simplified_importer.call_args_list],
+            [("f1classic_2010",), ("f1classic_2012",)],
+        )
+
+    def test_swofty_mod_import_uses_official_importer_and_persists_profile_selection(self):
+        installer = self.ctx["mod_installer"]
+        bridge = MagicMock()
+        bridge.import_mods.return_value = {"ok": True, "addon_ids": ["mod.carpack"]}
+        installer.swofty_bridge = bridge
+        archive = self.tmp / "F1 25 mod.7z"
+        archive.write_bytes(b"test archive")
+
+        result = installer.import_swofty_mod(archive, 2012)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        bridge.import_mods.assert_called_once_with(archive.resolve(), self.game_25, "f1classic_2012")
+        self.assertEqual(self.ctx["config"].data["selected_swofty_profile_year"], 2012)
+        self.assertEqual(result["addon_ids"], ["mod.carpack"])
+
+    def test_swofty_addon_import_is_recorded_under_only_the_selected_season_profile(self):
+        installer = self.ctx["mod_installer"]
+        bridge = MagicMock()
+        bridge.install_addon_from_path.return_value = {
+            "ok": True,
+            "addon_ids": ["sample.direct-addon"],
+        }
+        installer.swofty_bridge = bridge
+        package = self.tmp / "sample.swoftyaddon"
+        package.write_bytes(b"test package")
+
+        result = installer.import_swofty_mod(package, 2010)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(
+            self.ctx["config"].data["swofty_direct_addons"],
+            {"f1classic_2010": ["sample.direct-addon"]},
+        )
+        self.assertEqual(
+            bridge.install_addon_from_path.call_args.args,
+            (package.resolve(), "f1classic_2010"),
+        )
+
+    def test_swofty_mod_state_is_retained_when_the_importer_reports_it_as_pending(self):
+        installer = self.ctx["mod_installer"]
+        bridge = MagicMock()
+        bridge.set_simplified_mod_enabled.return_value = {"ok": True}
+        bridge.ensure_simplified_importer.return_value = {"ok": True}
+        bridge.list_simplified_mods.return_value = {
+            "ok": True,
+            "mods": [{"id": "mod.pending", "enabled": None, "state_unknown": True}],
+            "addons": {},
+        }
+        installer.swofty_bridge = bridge
+
+        updated = installer.set_swofty_mod_enabled(2012, "mod.pending", True, remember_unknown=True)
+        profile = installer.get_swofty_mod_profile(2012)
+
+        self.assertTrue(updated["ok"])
+        self.assertEqual(profile["mods"][0]["enabled"], True)
+        self.assertTrue(profile["mods"][0]["state_unknown"])
+        self.assertEqual(
+            self.ctx["config"].data["swofty_mod_enabled_overrides"]["f1classic_2012"]["mod.pending"],
+            True,
+        )
+
+    def test_standalone_serps_and_erp_files_are_rejected_with_actionable_errors(self):
+        installer = self.ctx["mod_installer"]
+        bridge = MagicMock()
+        installer.swofty_bridge = bridge
+        for suffix in (".erp", ".serps"):
+            source = self.tmp / f"orphan{suffix}"
+            source.write_bytes(b"not a package")
+            with self.subTest(suffix=suffix):
+                result = installer.import_swofty_mod(source, 2010)
+                self.assertFalse(result["ok"])
+                self.assertIn("Import the original mod folder", result["error"])
+        bridge.import_mods.assert_not_called()
 
     def _create_season_package(self, season_id, year, files):
         source = self.tmp / f"source_{season_id}"
@@ -169,6 +276,16 @@ class TestF1ClassicLauncher(unittest.TestCase):
         stored = Path(self.ctx["config"].data["seasons_dir"]) / "safe.update"
         self.assertEqual((stored / "payload.txt").read_text(encoding="utf-8"), "original")
 
+    def test_failed_package_removal_is_reported_instead_of_succeeding_silently(self):
+        imported = self._create_season_package("remove.failure", 2010, {"cars/a.erp": "MOD"})
+        self.assertTrue(imported["ok"], imported.get("errors"))
+        with patch("core.season_manager.shutil.rmtree", side_effect=OSError("simulated delete failure")):
+            result = self.ctx["season_manager"].remove_season("remove.failure")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("simulated delete failure", result["error"])
+        self.assertTrue(self.ctx["season_manager"].get_season("remove.failure"))
+
     def test_raw_nested_mod_import_activation_deactivation_and_vanilla_launch(self):
         archive = self.tmp / "nested_mod.zip"
         with zipfile.ZipFile(archive, "w") as package:
@@ -192,8 +309,9 @@ class TestF1ClassicLauncher(unittest.TestCase):
         self.assertTrue(self.bridge.addons["f1classic.launcher"])
 
         modded = self.ctx["game_detector"].launch_game("F1 25")
-        self.assertTrue(modded["ok"])
-        self.assertEqual(self.bridge.launches[-1][1], True)
+        self.assertFalse(modded["ok"])
+        self.assertIn("without EA AntiCheat", modded["error"])
+        self.assertEqual(self.bridge.launches, [])
 
         deactivated = self.ctx["mod_installer"].uninstall_season(imported["season_id"])
         self.assertTrue(deactivated["ok"], deactivated.get("error"))
@@ -296,6 +414,108 @@ class TestF1ClassicLauncher(unittest.TestCase):
         self.assertEqual(Path(context["config"].data["seasons_dir"]), user_data / "F1ClassicLauncher" / "seasons")
         self.assertEqual(Path(context["config"].data["swofty_data_dir"]), user_data / "F1ClassicLauncher" / "Swofty")
 
+    def test_config_save_keeps_previous_state_if_atomic_replace_fails(self):
+        config = self.ctx["config"]
+        original = config.config_file.read_bytes()
+        config.data["default_game"] = "Broken partial write"
+        with patch("core.config_manager.os.replace", side_effect=OSError("simulated replace failure")):
+            with self.assertRaisesRegex(OSError, "simulated replace failure"):
+                config.save()
+
+        self.assertEqual(config.config_file.read_bytes(), original)
+        self.assertEqual(list(config.config_dir.glob(".settings-*.tmp")), [])
+
+    def test_invalid_settings_are_preserved_and_reported(self):
+        config_dir = self.tmp / "invalid_settings" / "config"
+        config_dir.mkdir(parents=True)
+        settings = config_dir / "settings.json"
+        settings.write_text("{invalid", encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "Could not load launcher settings"):
+            from core.config_manager import ConfigManager
+            ConfigManager(config_dir.parent)
+
+        self.assertEqual(settings.read_text(encoding="utf-8"), "{invalid")
+
+    def test_external_launch_profile_and_enabled_state_persist(self):
+        self.ctx["config"].set_external_launch_enabled(True)
+        self.ctx["config"].set_external_launch_profile("season.f1-25-2012")
+
+        from core.config_manager import ConfigManager
+        reloaded = ConfigManager(self.app_dir)
+
+        self.assertTrue(reloaded.get_external_launch_enabled())
+        self.assertEqual(reloaded.get_external_launch_profile(), "season.f1-25-2012")
+
+    def test_f1_25_process_monitor_detects_independent_start_and_shutdown_without_subprocess(self):
+        process_names = []
+        monitor = GameProcessMonitor(lambda: list(process_names))
+
+        with patch("subprocess.Popen") as popen:
+            self.assertFalse(monitor.is_f1_25_running())
+            process_names.append(r"C:\Program Files\EA Games\F1 25\F1_25.exe")
+            self.assertTrue(monitor.is_f1_25_running())
+            self.assertTrue(monitor.is_f1_25_running())
+            process_names.clear()
+            self.assertFalse(monitor.is_f1_25_running())
+
+        popen.assert_not_called()
+
+    def test_external_launch_detects_existing_game_and_updates_only_on_state_changes(self):
+        with patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
+            from PySide6.QtWidgets import QApplication
+            from ui.desktop_app import F1ClassicLauncherWindow
+
+            self._create_season_package("season.2010.external", 2010, {"cars/a.erp": "2010"})
+            self._create_season_package("season.2012.external", 2012, {"cars/b.erp": "2012"})
+            self.ctx["config"].set_external_launch_enabled(True)
+            self.ctx["config"].set_external_launch_profile("season.2010.external")
+            self.ctx["config"].set_active_season("F1 25", "season.2010.external")
+            process_monitor = FakeGameProcessMonitor(running=True)
+            self.ctx["game_process_monitor"] = process_monitor
+
+            app = QApplication.instance() or QApplication([])
+            window = F1ClassicLauncherWindow(self.ctx)
+            deadline = time.monotonic() + 10
+            while window.operation_worker is not None and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            app.processEvents()
+
+            self.assertTrue(window.external_game_timer.isActive())
+            self.assertEqual(window.external_game_timer.interval(), 3000)
+            self.assertEqual(window.external_game_status.text(), "F1 25 status: Running")
+            self.assertEqual(window.external_profile_status.text(), "Selected profile: 2010")
+            self.assertEqual(window.external_mod_status.text(), "Mod status: Not verified")
+            self.assertEqual(process_monitor.calls, 1)
+
+            window._poll_external_game()
+            self.assertEqual(process_monitor.calls, 2)
+            log_text = self.ctx["logger"].log_file.read_text(encoding="utf-8")
+            self.assertEqual(log_text.count("External F1 25 process started."), 1)
+
+            index = window.external_profile_combo.findData("season.2012.external")
+            window.external_profile_combo.setCurrentIndex(index)
+            self.assertEqual(self.ctx["config"].get_external_launch_profile(), "season.2012.external")
+            self.assertEqual(window.external_profile_status.text(), "Selected profile: 2012")
+            self.assertEqual(window.external_mod_status.text(), "Mod status: Inactive")
+
+            process_monitor.running = False
+            window._poll_external_game()
+            self.assertEqual(window.external_game_status.text(), "F1 25 status: Not running")
+            log_text = self.ctx["logger"].log_file.read_text(encoding="utf-8")
+            self.assertIn("External F1 25 process closed.", log_text)
+
+            calls_before_disable = process_monitor.calls
+            window.external_launch_enabled_checkbox.setChecked(False)
+            self.assertFalse(window.external_game_timer.isActive())
+            self.assertEqual(window.external_launch_status.text(), "External launch: Disabled")
+            window._poll_external_game()
+            self.assertEqual(process_monitor.calls, calls_before_disable)
+
+            window.close()
+            self.assertFalse(window.external_game_timer.isActive())
+
     def test_existing_launcher_data_migrates_to_user_data_directory(self):
         legacy = self.tmp / "old_install"
         user_data = self.tmp / "LocalAppData" / "F1ClassicLauncher"
@@ -334,6 +554,7 @@ class TestF1ClassicLauncher(unittest.TestCase):
             py_compile.compile(str(py_file), doraise=True)
         self.assertFalse((ROOT_DIR / "app_server.py").exists())
         self.assertFalse((ROOT_DIR / "frontend.html").exists())
+        self.assertIn("pythonw.exe", (ROOT_DIR / "Launch_F1_Classic_Launcher.vbs").read_text(encoding="utf-8"))
         main_src = (ROOT_DIR / "main.py").read_text(encoding="utf-8")
         self.assertIn("QApplication", (ROOT_DIR / "ui" / "desktop_app.py").read_text(encoding="utf-8"))
         self.assertNotIn("http.server", main_src)
@@ -348,10 +569,65 @@ class TestF1ClassicLauncher(unittest.TestCase):
             self.assertTrue(activated["ok"], activated.get("error"))
             window = F1ClassicLauncherWindow(self.ctx)
             window._open_season_details("ui.2010.mod")
+            deadline = time.monotonic() + 10
+            while window.operation_worker is not None and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
             app.processEvents()
             self.assertEqual(window.windowTitle(), "F1 Classic Launcher")
             self.assertEqual(window.season_addon_order.count(), 1)
             window.close()
+
+    def test_background_operations_are_exclusive_and_keep_ui_responsive(self):
+        with patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
+            from PySide6.QtWidgets import QApplication
+            from ui.desktop_app import F1ClassicLauncherWindow
+
+            app = QApplication.instance() or QApplication([])
+            window = F1ClassicLauncherWindow(self.ctx)
+            deadline = time.monotonic() + 10
+            while window.operation_worker is not None and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_operation(_progress):
+                entered.set()
+                release.wait(5)
+                return {"ok": True}
+
+            self.assertTrue(window._start_operation("Test operation", blocked_operation))
+            self.assertTrue(entered.wait(2))
+            self.assertFalse(window._start_operation("Duplicate operation", lambda _progress: {"ok": True}))
+            self.assertFalse(window.centralWidget().isEnabled())
+            app.processEvents()
+            self.assertIn("Wait for", window.operation_status.text())
+
+            release.set()
+            deadline = time.monotonic() + 5
+            while window.operation_worker is not None and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            self.assertIsNone(window.operation_worker)
+            self.assertTrue(window.centralWidget().isEnabled())
+            window.close()
+
+    def test_background_worker_reports_and_logs_operation_exceptions(self):
+        from ui.desktop_app import OperationWorker
+
+        def fail(_progress):
+            raise RuntimeError("simulated worker failure")
+
+        worker = OperationWorker(fail, self.ctx["logger"])
+        worker.run()
+
+        self.assertFalse(worker.result["ok"])
+        self.assertEqual(worker.result["error"], "simulated worker failure")
+        log_text = self.ctx["logger"].log_file.read_text(encoding="utf-8")
+        self.assertIn("Background launcher operation failed", log_text)
+        self.assertIn("RuntimeError: simulated worker failure", log_text)
 
 
 if __name__ == "__main__":
