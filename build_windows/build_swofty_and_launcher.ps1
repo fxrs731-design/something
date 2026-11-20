@@ -110,9 +110,13 @@ $BuildGraph = Join-Path $SwoftyRepo "native\tools\build_graph.py"
 if (-not (Test-Path $BuildGraph)) {
     throw "Expected native/tools/build_graph.py not found at: $BuildGraph"
 }
-python (Join-Path $PSScriptRoot "patch_swofty_build.py") $BuildGraph
+$InitCheck = Join-Path $SwoftyRepo "native\tools\init_check.py"
+if (-not (Test-Path $InitCheck)) {
+    throw "Expected native/tools/init_check.py not found at: $InitCheck"
+}
+python (Join-Path $PSScriptRoot "patch_swofty_build.py") $BuildGraph $InitCheck
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to apply verified Windows compatibility fixes to Swofty build_graph.py."
+    throw "Failed to apply verified Windows compatibility fixes to Swofty native build tools."
 }
 
 Write-Host "Building Swofty CLI via $CliManifest..."
