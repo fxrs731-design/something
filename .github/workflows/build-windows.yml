@@ -1,0 +1,46 @@
+name: Build F1 Classic Launcher (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, "fix/windows-build-setup" ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify Python
+        shell: pwsh
+        run: python --version
+
+      - name: Run automated tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s . -p "test_*.py" -v
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: ./build_windows/build_launcher.ps1
+
+      - name: Package portable release
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/F1ClassicLauncher_Windows/* -DestinationPath F1ClassicLauncher_Windows.zip -Force
+          if (!(Test-Path F1ClassicLauncher_Windows.zip)) { throw "Release ZIP was not created." }
+
+      - name: Upload Windows release
+        uses: actions/upload-artifact@v4
+        with:
+          name: F1ClassicLauncher_Windows
+          path: F1ClassicLauncher_Windows.zip
+          if-no-files-found: error
+          retention-days: 14
