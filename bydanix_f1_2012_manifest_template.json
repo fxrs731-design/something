@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "bydanix.f1-2012-season",
+  "name": "ByDaniX F1 2012 Season (Template)",
+  "version": "1.0.0",
+  "author": "ByDaniX",
+  "description": "Template manifest for integrating the ByDaniX F1 2012 season mod once actual mod files are supplied.",
+  "game": "F1 2012",
+  "season": 2012,
+  "artwork": "cover.png",
+  "adapter": "bydanix_legacy",
+  "dependencies": [],
+  "teams": [],
+  "drivers": [],
+  "operations": [
+    {
+      "type": "bydanix_merge",
+      "source": "mod_files",
+      "target": "."
+    }
+  ],
+  "notes": "Place the original ByDaniX F1 2012 mod directory tree inside 'mod_files/' and adjust operations after inspecting the supplied archive."
+}

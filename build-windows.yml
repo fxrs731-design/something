@@ -1,0 +1,78 @@
+name: Build F1 Classic Launcher (PySide6 Desktop + Swofty Core)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust 1.95+
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Verify build tools
+        shell: pwsh
+        run: |
+          python --version
+          rustc --version
+          cargo --version
+          zig version
+          git --version
+
+      - name: Install Python desktop dependencies (PySide6 + PyInstaller)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Python automated tests
+        run: python -m unittest discover -s . -p "test_*.py" -v
+
+      - name: Build Swofty Core and PySide6 F1ClassicLauncher.exe
+        shell: pwsh
+        run: ./build_windows/build_swofty_and_launcher.ps1
+
+      - name: Verify release files
+        shell: pwsh
+        run: |
+          $ReleaseDir = "dist/F1ClassicLauncher_Full"
+
+          if (!(Test-Path "$ReleaseDir/F1ClassicLauncher.exe")) {
+            throw "F1ClassicLauncher.exe missing."
+          }
+
+          if (!(Test-Path "$ReleaseDir/swofty_core/swofty.exe")) {
+            throw "Swofty executable missing."
+          }
+
+          if (!(Test-Path "$ReleaseDir/swofty_core/native/dist")) {
+            throw "Swofty native files missing."
+          }
+
+      - name: Package portable Windows release
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/F1ClassicLauncher_Full/* -DestinationPath F1ClassicLauncher_Windows_Full.zip -Force
+
+      - name: Upload Windows executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: F1ClassicLauncher_Windows_Full
+          path: F1ClassicLauncher_Windows_Full.zip
+          if-no-files-found: error
+          retention-days: 14
