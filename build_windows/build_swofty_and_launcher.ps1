@@ -92,6 +92,29 @@ if (Test-Path "THIRD_PARTY.md") {
 if (-not (Test-Path "native\build.sh")) {
     throw "Expected native/build.sh not found in SwoftyLauncher repository."
 }
+# The upstream Swofty build_graph.py currently treats three optional/legacy translation
+# units as mandatory even though they are absent from the current checkout:
+# registry/engine.cpp (test-only), hooks/guard.cpp, and diagnostics/crash/stall_walk.cpp.
+# Keep its source discovery behavior, but remove that stale existence assertion so the
+# native build can proceed with the source files actually present in this revision.
+$BuildGraphPatch = @'
+from pathlib import Path
+p = Path("native/tools/build_graph.py")
+s = p.read_text(encoding="utf-8")
+old = """    missing = (CORE_EXCLUDE | set(SEH_SOURCES)) - set(core_sources)
+    if missing:
+        sys.exit(f'build_graph.py: listed sources that no longer exist: {sorted(missing)}')
+"""
+if old not in s:
+    raise SystemExit("Expected stale build_graph.py source assertion was not found; refusing to patch.")
+p.write_text(s.replace(old, "    # Optional/legacy source entries may be absent in newer Swofty revisions.\\n"), encoding="utf-8")
+print("Patched build_graph.py: absent optional legacy sources are no longer fatal.")
+'@
+$BuildGraphPatch | python -
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply the Swofty build_graph.py compatibility patch."
+}
+
 Write-Host "Building native C++ loader via native/build.sh..."
 bash native/build.sh
 
