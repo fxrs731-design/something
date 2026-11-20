@@ -104,48 +104,10 @@ exec "$@"
 $env:PATH = "$ShimBin;$env:PATH"
 
 # 2. Check out the verified Swofty-Developments/SwoftyLauncher revision
-if (-not (Test-Path $SwoftyRepo)) {
-    git clone --no-checkout --depth 1 $SwoftyRemote $SwoftyRepo
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to clone SwoftyLauncher."
-    }
+python (Join-Path $PSScriptRoot "prepare_swofty_checkout.py") $SwoftyRepo $SwoftyRemote $SwoftyCommit
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to prepare the pinned SwoftyLauncher checkout. Existing changes were preserved."
 }
-
-if (-not (Test-Path (Join-Path $SwoftyRepo ".git"))) {
-    throw "The cached SwoftyLauncher path is not a Git checkout: $SwoftyRepo"
-}
-$CachedRemote = (git -C $SwoftyRepo remote get-url origin).Trim()
-if ($LASTEXITCODE -ne 0 -or $CachedRemote -ne $SwoftyRemote) {
-    throw "The cached SwoftyLauncher checkout has an unexpected origin: '$CachedRemote'."
-}
-$CachedHead = (git -C $SwoftyRepo rev-parse HEAD 2>$null)
-if ($LASTEXITCODE -eq 0) {
-    $CachedHead = $CachedHead.Trim()
-    if ($CachedHead -ne $SwoftyCommit) {
-        $CachedChanges = git -C $SwoftyRepo status --porcelain
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not inspect the cached SwoftyLauncher worktree."
-        }
-        if ($CachedChanges) {
-            throw "The cached SwoftyLauncher checkout has local changes and is not pinned to $SwoftyCommit. Preserve or clear that cache before rebuilding."
-        }
-    }
-}
-if ($CachedHead -ne $SwoftyCommit) {
-    git -C $SwoftyRepo fetch --depth 1 origin $SwoftyCommit
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to fetch pinned SwoftyLauncher commit $SwoftyCommit."
-    }
-    git -C $SwoftyRepo checkout --detach $SwoftyCommit
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to check out pinned SwoftyLauncher commit $SwoftyCommit."
-    }
-}
-$CheckedOutSwoftyCommit = (git -C $SwoftyRepo rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $CheckedOutSwoftyCommit -ne $SwoftyCommit) {
-    throw "SwoftyLauncher checkout mismatch: expected $SwoftyCommit, found '$CheckedOutSwoftyCommit'."
-}
-Write-Host "Verified SwoftyLauncher commit: $CheckedOutSwoftyCommit"
 
 # 3. Compile Swofty CLI + swofty-core (Rust) and native C++ loader DLLs
 Push-Location $SwoftyRepo
